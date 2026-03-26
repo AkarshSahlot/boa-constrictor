@@ -1,6 +1,9 @@
 // Utility Kernels - Copy, embedding lookup, and memory helpers
 #include "gemm_gpu_common.cuh"
 
+// Global stream definition (declared extern in gemm_gpu.hpp)
+cudaStream_t g_stream = 0;
+
 // ==========================================
 // Copy Operations
 // ==========================================
@@ -15,7 +18,7 @@ __global__ void ker_copy_2d(const float* src, float* dst, int W, int N, int S1, 
 }
 
 void gpu_copy_2d(const float* src, float* dst, int W, int N, int S1, int S2) {
-    ker_copy_2d<<<(N*W+255)/256, 256>>>(src, dst, W, N, S1, S2);
+    ker_copy_2d<<<(N*W+255)/256, 256, 0, g_stream>>>(src, dst, W, N, S1, S2);
     GPU_DEVICE_SYNC();
 }
 
@@ -32,7 +35,7 @@ void gpu_copy_strided(const float* src, float* dst, int src_stride, int width, s
     size_t total = batch * width;
     int block = 256;
     int grid = (int)((total + block - 1) / block);
-    ker_copy_strided<<<grid, block>>>(src, dst, src_stride, width, total);
+    ker_copy_strided<<<grid, block, 0, g_stream>>>(src, dst, src_stride, width, total);
     GPU_DEVICE_SYNC();
 }
 
@@ -41,20 +44,30 @@ void gpu_copy_strided(const float* src, float* dst, int src_stride, int width, s
 // ==========================================
 
 __global__ void ker_embedding_lookup_batch(const int* tokens, const float* embedding, float* out, int d_model, size_t total_elements) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < total_elements) {
-        size_t b = i / d_model;
-        int d = i % d_model;
+    // Vectorized: 4 elements per thread when d_model is a multiple of 4
+    size_t base = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (base + 3 < total_elements && (d_model % 4 == 0)) {
+        size_t b = base / d_model;
+        int d = base % d_model;
         int token = tokens[b];
-        out[i] = embedding[token * d_model + d];
+        float4 v = reinterpret_cast<const float4*>(&embedding[token * d_model + d])[0];
+        reinterpret_cast<float4*>(out)[base/4] = v;
+    } else {
+        for (size_t i = base; i < total_elements && i < base + 4; ++i) {
+            size_t b = i / d_model;
+            int d = i % d_model;
+            int token = tokens[b];
+            out[i] = embedding[token * d_model + d];
+        }
     }
 }
 
 void gpu_embedding_lookup_batch(const int* tokens, const float* embedding, float* out, int d_model, size_t batch) {
     size_t total = batch * d_model;
+    size_t elements_vec4 = (total + 3) / 4;
     int block = 256;
-    int grid = (int)((total + block - 1) / block);
-    ker_embedding_lookup_batch<<<grid, block>>>(tokens, embedding, out, d_model, total);
+    int grid = (int)((elements_vec4 + block - 1) / block);
+    ker_embedding_lookup_batch<<<grid, block, 0, g_stream>>>(tokens, embedding, out, d_model, total);
     GPU_DEVICE_SYNC();
 }
 

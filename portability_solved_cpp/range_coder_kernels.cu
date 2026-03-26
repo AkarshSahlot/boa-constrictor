@@ -3,6 +3,14 @@
 
 #define PRECISION 24
 
+// Temperature scaling: inv_temperature = 1.0/T applied to logits before softmax
+__constant__ float d_inv_temperature = 1.0f;
+
+void gpu_set_temperature(float temperature) {
+    float inv_t = 1.0f / temperature;
+    checkCudaErrors(cudaMemcpyToSymbol(d_inv_temperature, &inv_t, sizeof(float)));
+}
+
 // ==========================================
 // CDF Building Helper
 // ==========================================
@@ -47,7 +55,7 @@ __global__ void ker_rc_init(RCState* states, int N) {
 }
 
 void gpu_rc_init(RCState* states, int batch_size) {
-    ker_rc_init<<<(batch_size+255)/256, 256>>>(states, batch_size);
+    ker_rc_init<<<(batch_size+255)/256, 256, 0, g_stream>>>(states, batch_size);
     GPU_DEVICE_SYNC();
 }
 
@@ -117,7 +125,7 @@ __global__ void ker_rc_encode_step(const float* logits, const int* targets, RCSt
         float probs[256];
         float sum = 0.0f;
         for(int j=0; j<vocab_size; ++j) {
-            float val = __expf(l[j] - max_l);
+            float val = __expf((l[j] - max_l) * d_inv_temperature);
             probs[j] = val;
             sum += val;
         }
@@ -145,7 +153,7 @@ __global__ void ker_rc_encode_step_strided(const float* logits, const int* targe
         float probs[256];
         float sum = 0.0f;
         for(int j=0; j<vocab_size; ++j) {
-            float val = __expf(l[j] - max_l);
+            float val = __expf((l[j] - max_l) * d_inv_temperature);
             probs[j] = val;
             sum += val;
         }
@@ -169,7 +177,7 @@ __global__ void ker_rc_encode_step_masked(const float* logits, const int* target
         float probs[256];
         float sum = 0.0f;
         for(int j=0; j<vocab_size; ++j) {
-            float val = __expf(l[j] - max_l);
+            float val = __expf((l[j] - max_l) * d_inv_temperature);
             probs[j] = val;
             sum += val;
         }
@@ -207,7 +215,7 @@ __global__ void ker_rc_encode_chunk_strided(const float* logits, const int* chun
 
             float sum = 0.0f;
             for(int j=0; j<vocab_size; ++j) {
-                float val = __expf(l[j] - max_l);
+                float val = __expf((l[j] - max_l) * d_inv_temperature);
                 probs[j] = val;
                 sum += val;
             }
@@ -300,7 +308,7 @@ __global__ void ker_rc_finish(RCState* states, unsigned int* out_words, int pitc
 }
 
 void gpu_rc_finish_batch(RCState* states, unsigned int* out_bufs, int pitch_words, int* sizes_words, int batch_size) {
-    ker_rc_finish<<<(batch_size+255)/256, 256>>>(states, out_bufs, pitch_words, sizes_words, batch_size);
+    ker_rc_finish<<<(batch_size+255)/256, 256, 0, g_stream>>>(states, out_bufs, pitch_words, sizes_words, batch_size);
     checkCudaErrors(cudaGetLastError());
 }
 
@@ -322,7 +330,7 @@ __global__ void ker_rc_init_decoder(RCDecState* states, const unsigned int* in_w
 }
 
 void gpu_rc_init_decoder(RCDecState* states, const unsigned int* in_bufs, const int* sizes_words, int pitch_words, int batch_size) {
-    ker_rc_init_decoder<<<(batch_size+255)/256, 256>>>(states, in_bufs, sizes_words, pitch_words, batch_size);
+    ker_rc_init_decoder<<<(batch_size+255)/256, 256, 0, g_stream>>>(states, in_bufs, sizes_words, pitch_words, batch_size);
     checkCudaErrors(cudaGetLastError());
 }
 
@@ -363,7 +371,7 @@ __global__ void ker_rc_decode_step_warp(const float* logits, const int* in_token
     double my_sum_d = 0.0;
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        float val = __expf(my_vals[i] - batch_max);
+        float val = __expf((my_vals[i] - batch_max) * d_inv_temperature);
         my_vals[i] = val; 
         my_sum_d += (double)val;
     }
@@ -388,56 +396,82 @@ __global__ void ker_rc_decode_step_warp(const float* logits, const int* in_token
 
     __syncwarp();
 
-    // 4. Decode (Lane 0 Only)
-    if (lane == 0) {
-        RCDecState &st = states[b];
-        const unsigned int* in = in_words + (size_t)b * (size_t)pitch_words;
-    
+    // Enforce CDF monotonicity at warp lane boundaries (parallel fixup)
+    if (lane > 0) {
+        double prev_end = s_cdf[lane * 8 - 1];
+        double my_start = s_cdf[lane * 8];
+        if (my_start < prev_end) {
+            double delta = prev_end - my_start;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) s_cdf[lane * 8 + i] += delta;
+        }
+    }
+    __syncwarp();
+
+    // 4. Decode — Warp-parallel CDF search (all 32 lanes participate)
+    {
+        RCDecState st_local;
+        unsigned int target;
+        double scale_double;
+        unsigned long long scale_rc;
         const unsigned int PRECISION_BITS = 24;
         const unsigned int TOTAL = (1u<<PRECISION_BITS);
-        
-        unsigned long long scale_rc = st.range >> PRECISION_BITS;
-        unsigned long long q = (st.point - st.lower) / scale_rc;
-        if (q >= (1ull<<PRECISION_BITS)) q = (1ull<<PRECISION_BITS)-1ull;
-        unsigned int target = (unsigned int)q;
-        
-        double scale_double = (double)(TOTAL - 256);
-        
-        int s = 0; 
+
+        if (lane == 0) {
+            st_local = states[b];
+            scale_rc = st_local.range >> PRECISION_BITS;
+            unsigned long long q = (st_local.point - st_local.lower) / scale_rc;
+            if (q >= (1ull<<PRECISION_BITS)) q = (1ull<<PRECISION_BITS)-1ull;
+            target = (unsigned int)q;
+            scale_double = (double)(TOTAL - 256);
+        }
+        target = __shfl_sync(0xFFFFFFFF, target, 0);
+        // Broadcast scale_double via its two 32-bit halves
+        {
+            unsigned long long sd_bits;
+            if (lane == 0) sd_bits = __double_as_longlong(scale_double);
+            unsigned int sd_lo = __shfl_sync(0xFFFFFFFF, (unsigned int)(sd_bits), 0);
+            unsigned int sd_hi = __shfl_sync(0xFFFFFFFF, (unsigned int)(sd_bits >> 32), 0);
+            sd_bits = ((unsigned long long)sd_hi << 32) | sd_lo;
+            scale_double = __longlong_as_double(sd_bits);
+        }
+
+        int s = 0;
         unsigned int low_s = 0;
         unsigned int high_s = 0;
-        
-        for (int k=0; k<256; ++k) {
-             double p_low = s_cdf[k];
-             double p_high = k==255 ? 1.0 : s_cdf[k+1];
-             
-             unsigned int l_int = (unsigned int)(p_low * scale_double) + k;
-             unsigned int h_int = (unsigned int)(p_high * scale_double) + (k + 1);
-             if (k==255) h_int = TOTAL;
-             
-             if (target >= l_int && target < h_int) {
-                 s = k;
-                 low_s = l_int;
-                 high_s = h_int;
-                 break;
-             }
-        }
-        
-        out_symbols[b] = s;
-        
-        unsigned int left = low_s;
-        unsigned int prob = high_s - low_s;
-        
-        if (prob == 0) prob = 1;
 
-        st.lower = st.lower + scale_rc * (unsigned long long)left;
-        st.range = scale_rc * (unsigned long long)prob;
-        
-        while (st.range < (1ull << (64-32))) {
-            st.lower <<= 32;
-            st.range <<= 32;
-            unsigned int w = (st.read_idx_words < sizes_words[b]) ? in[st.read_idx_words++] : 0u;
-            st.point = (st.point << 32) | (unsigned long long)w;
+        for (int round = 0; round < 8; ++round) {
+            int k = round * 32 + lane;
+            double p_low = s_cdf[k];
+            double p_high = (k == 255) ? 1.0 : s_cdf[k + 1];
+            unsigned int l_int = (unsigned int)(p_low * scale_double) + k;
+            unsigned int h_int = (unsigned int)(p_high * scale_double) + (k + 1);
+            if (k == 255) h_int = TOTAL;
+            bool match = (target >= l_int && target < h_int);
+            unsigned int ballot = __ballot_sync(0xFFFFFFFF, match);
+            if (ballot != 0) {
+                int winner = __ffs(ballot) - 1;
+                s = __shfl_sync(0xFFFFFFFF, k, winner);
+                low_s = __shfl_sync(0xFFFFFFFF, l_int, winner);
+                high_s = __shfl_sync(0xFFFFFFFF, h_int, winner);
+                break;
+            }
+        }
+
+        if (lane == 0) {
+            out_symbols[b] = s;
+            unsigned int prob = high_s - low_s;
+            if (prob == 0) prob = 1;
+            st_local.lower = st_local.lower + scale_rc * (unsigned long long)low_s;
+            st_local.range = scale_rc * (unsigned long long)prob;
+            const unsigned int* in = in_words + (size_t)b * (size_t)pitch_words;
+            while (st_local.range < (1ull << (64-32))) {
+                st_local.lower <<= 32;
+                st_local.range <<= 32;
+                unsigned int w = (st_local.read_idx_words < sizes_words[b]) ? in[st_local.read_idx_words++] : 0u;
+                st_local.point = (st_local.point << 32) | (unsigned long long)w;
+            }
+            states[b] = st_local;
         }
     }
 }
@@ -446,7 +480,7 @@ void gpu_rc_decode_step_batch(const float* logits, const int* in_tokens, const i
     if (vocab_size != 256) {
         printf("Error: Warp Decode requires Vocab=256\n"); return;
     }
-    ker_rc_decode_step_warp<<<batch_size, 32>>>(logits, in_tokens, lengths, t, out_symbols, states, in_bufs, sizes_words, pitch_words, vocab_size, batch_size);
+    ker_rc_decode_step_warp<<<batch_size, 32, 0, g_stream>>>(logits, in_tokens, lengths, t, out_symbols, states, in_bufs, sizes_words, pitch_words, vocab_size, batch_size);
     checkCudaErrors(cudaGetLastError());
 }
 
@@ -489,7 +523,7 @@ __global__ void ker_rc_decode_fused_step_warp(const float* logits, const float* 
     double my_sum_d = 0.0;
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        float val = __expf(my_vals[i] - batch_max);
+        float val = __expf((my_vals[i] - batch_max) * d_inv_temperature);
         my_vals[i] = val; 
         my_sum_d += (double)val;
     }
@@ -514,57 +548,82 @@ __global__ void ker_rc_decode_fused_step_warp(const float* logits, const float* 
 
     __syncwarp();
 
-    // 4. Decode (Lane 0)
-    if (lane == 0) {
-        RCDecState &st = states[b];
-        const unsigned int* in = in_words + (size_t)b * (size_t)pitch_words;
-    
+    // Enforce CDF monotonicity at warp lane boundaries (parallel fixup)
+    if (lane > 0) {
+        double prev_end = s_cdf[lane * 8 - 1];
+        double my_start = s_cdf[lane * 8];
+        if (my_start < prev_end) {
+            double delta = prev_end - my_start;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) s_cdf[lane * 8 + i] += delta;
+        }
+    }
+    __syncwarp();
+
+    // 4. Decode — Warp-parallel CDF search
+    {
+        RCDecState st_local;
+        unsigned int target;
+        double scale_double;
+        unsigned long long scale_rc;
         const unsigned int PRECISION_BITS = 24;
         const unsigned int TOTAL = (1u<<PRECISION_BITS);
-        
-        unsigned long long scale_rc = st.range >> PRECISION_BITS;
-        unsigned long long q = (st.point - st.lower) / scale_rc;
-        if (q >= (1ull<<PRECISION_BITS)) q = (1ull<<PRECISION_BITS)-1ull;
-        unsigned int target = (unsigned int)q;
-        
-        double scale_double = (double)(TOTAL - 256);
-        
-        int s = 0; 
+
+        if (lane == 0) {
+            st_local = states[b];
+            scale_rc = st_local.range >> PRECISION_BITS;
+            unsigned long long q = (st_local.point - st_local.lower) / scale_rc;
+            if (q >= (1ull<<PRECISION_BITS)) q = (1ull<<PRECISION_BITS)-1ull;
+            target = (unsigned int)q;
+            scale_double = (double)(TOTAL - 256);
+        }
+        target = __shfl_sync(0xFFFFFFFF, target, 0);
+        {
+            unsigned long long sd_bits;
+            if (lane == 0) sd_bits = __double_as_longlong(scale_double);
+            unsigned int sd_lo = __shfl_sync(0xFFFFFFFF, (unsigned int)(sd_bits), 0);
+            unsigned int sd_hi = __shfl_sync(0xFFFFFFFF, (unsigned int)(sd_bits >> 32), 0);
+            sd_bits = ((unsigned long long)sd_hi << 32) | sd_lo;
+            scale_double = __longlong_as_double(sd_bits);
+        }
+
+        int s = 0;
         unsigned int low_s = 0;
         unsigned int high_s = 0;
-        
-        for (int k=0; k<256; ++k) {
-             double p_low = s_cdf[k];
-             double p_high = k==255 ? 1.0 : s_cdf[k+1];
-             
-             unsigned int l_int = (unsigned int)(p_low * scale_double) + k;
-             unsigned int h_int = (unsigned int)(p_high * scale_double) + (k + 1);
-             if (k==255) h_int = TOTAL;
-             
-             if (target >= l_int && target < h_int) {
-                 s = k;
-                 low_s = l_int;
-                 high_s = h_int;
-                 break;
-             }
-        }
-        
-        // 5. Fused: Storage & Update
-        d_tokens[b] = s;
-        d_batch_output[b * chunk_size + t] = s;
-        
-        unsigned int left = low_s;
-        unsigned int prob = high_s - low_s;
-        if (prob == 0) prob = 1;
 
-        st.lower = st.lower + scale_rc * (unsigned long long)left;
-        st.range = scale_rc * (unsigned long long)prob;
-        
-        while (st.range < (1ull << (64-32))) {
-            st.lower <<= 32;
-            st.range <<= 32;
-            unsigned int w = (st.read_idx_words < sizes_words[b]) ? in[st.read_idx_words++] : 0u;
-            st.point = (st.point << 32) | (unsigned long long)w;
+        for (int round = 0; round < 8; ++round) {
+            int k = round * 32 + lane;
+            double p_low = s_cdf[k];
+            double p_high = (k == 255) ? 1.0 : s_cdf[k + 1];
+            unsigned int l_int = (unsigned int)(p_low * scale_double) + k;
+            unsigned int h_int = (unsigned int)(p_high * scale_double) + (k + 1);
+            if (k == 255) h_int = TOTAL;
+            bool match = (target >= l_int && target < h_int);
+            unsigned int ballot = __ballot_sync(0xFFFFFFFF, match);
+            if (ballot != 0) {
+                int winner = __ffs(ballot) - 1;
+                s = __shfl_sync(0xFFFFFFFF, k, winner);
+                low_s = __shfl_sync(0xFFFFFFFF, l_int, winner);
+                high_s = __shfl_sync(0xFFFFFFFF, h_int, winner);
+                break;
+            }
+        }
+
+        if (lane == 0) {
+            d_tokens[b] = s;
+            d_batch_output[b * chunk_size + t] = s;
+            unsigned int prob = high_s - low_s;
+            if (prob == 0) prob = 1;
+            st_local.lower = st_local.lower + scale_rc * (unsigned long long)low_s;
+            st_local.range = scale_rc * (unsigned long long)prob;
+            const unsigned int* in = in_words + (size_t)b * (size_t)pitch_words;
+            while (st_local.range < (1ull << (64-32))) {
+                st_local.lower <<= 32;
+                st_local.range <<= 32;
+                unsigned int w = (st_local.read_idx_words < sizes_words[b]) ? in[st_local.read_idx_words++] : 0u;
+                st_local.point = (st_local.point << 32) | (unsigned long long)w;
+            }
+            states[b] = st_local;
         }
     }
 }
@@ -575,6 +634,167 @@ void gpu_rc_decode_fused_step_batch(const float* logits, const float* head_b2, i
     }
     ker_rc_decode_fused_step_warp<<<batch_size, 32>>>(logits, head_b2, d_tokens, lengths, t, d_batch_output, chunk_size, states, in_bufs, sizes_words, pitch_words, vocab_size, batch_size);
     checkCudaErrors(cudaGetLastError());
+}
+
+// ==========================================
+// Device-pointer t variant for CUDA Graph
+// ==========================================
+
+__global__ void ker_rc_decode_fused_step_warp_dptr(const float* logits, const float* head_b2, int* d_tokens, 
+                                             const int* lengths, const int* d_t, int* d_batch_output, int chunk_size, 
+                                             RCDecState* states, const unsigned int* in_words, 
+                                             const int* sizes_words, int pitch_words, int vocab_size, int batch_size) {
+    int b = blockIdx.x;
+    if (b >= batch_size) return;
+    
+    int lane = threadIdx.x;
+    int t = *d_t;
+
+    if (lengths && t >= lengths[b]) {
+        return;
+    }
+
+    const float* l_ptr = logits + (size_t)b * vocab_size;
+
+    __shared__ volatile double s_cdf[260];
+
+    // 1. Load, Add Bias & Max Reduction
+    float my_vals[8];
+    float my_max = -1e30f;
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        int col = lane * 8 + i;
+        float val = l_ptr[col] + head_b2[col];
+        my_vals[i] = val; 
+        my_max = fmaxf(my_max, val);
+    }
+    float batch_max = warpReduceMax(my_max);
+    batch_max = __shfl_sync(0xFFFFFFFF, batch_max, 0); 
+
+    // 2. Exp & Sum (Double)
+    double my_sum_d = 0.0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float val = __expf((my_vals[i] - batch_max) * d_inv_temperature);
+        my_vals[i] = val; 
+        my_sum_d += (double)val;
+    }
+    double batch_sum = warpReduceSumDouble(my_sum_d);
+    batch_sum = __shfl_sync(0xFFFFFFFF, batch_sum, 0); 
+    
+    double inv_sum = 1.0 / batch_sum;
+
+    // 3. Normalize & Local CDF
+    double thread_sum = my_sum_d * inv_sum;
+    double warp_prefix = warpScanSumDouble(thread_sum); 
+    double warp_start = warp_prefix - thread_sum; 
+
+    double running = warp_start;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        int idx = lane * 8 + i;
+        s_cdf[idx] = running;
+        running += (double)my_vals[i] * inv_sum; 
+    }
+    if (lane == 31) s_cdf[256] = 1.0; 
+
+    __syncwarp();
+
+    // Enforce CDF monotonicity at warp lane boundaries (parallel fixup)
+    if (lane > 0) {
+        double prev_end = s_cdf[lane * 8 - 1];
+        double my_start = s_cdf[lane * 8];
+        if (my_start < prev_end) {
+            double delta = prev_end - my_start;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) s_cdf[lane * 8 + i] += delta;
+        }
+    }
+    __syncwarp();
+
+    // 4. Decode — Warp-parallel CDF search
+    {
+        RCDecState st_local;
+        unsigned int target;
+        double scale_double;
+        unsigned long long scale_rc;
+        const unsigned int PRECISION_BITS = 24;
+        const unsigned int TOTAL = (1u<<PRECISION_BITS);
+
+        if (lane == 0) {
+            st_local = states[b];
+            scale_rc = st_local.range >> PRECISION_BITS;
+            unsigned long long q = (st_local.point - st_local.lower) / scale_rc;
+            if (q >= (1ull<<PRECISION_BITS)) q = (1ull<<PRECISION_BITS)-1ull;
+            target = (unsigned int)q;
+            scale_double = (double)(TOTAL - 256);
+        }
+        target = __shfl_sync(0xFFFFFFFF, target, 0);
+        {
+            unsigned long long sd_bits;
+            if (lane == 0) sd_bits = __double_as_longlong(scale_double);
+            unsigned int sd_lo = __shfl_sync(0xFFFFFFFF, (unsigned int)(sd_bits), 0);
+            unsigned int sd_hi = __shfl_sync(0xFFFFFFFF, (unsigned int)(sd_bits >> 32), 0);
+            sd_bits = ((unsigned long long)sd_hi << 32) | sd_lo;
+            scale_double = __longlong_as_double(sd_bits);
+        }
+
+        int s = 0;
+        unsigned int low_s = 0;
+        unsigned int high_s = 0;
+
+        for (int round = 0; round < 8; ++round) {
+            int k = round * 32 + lane;
+            double p_low = s_cdf[k];
+            double p_high = (k == 255) ? 1.0 : s_cdf[k + 1];
+            unsigned int l_int = (unsigned int)(p_low * scale_double) + k;
+            unsigned int h_int = (unsigned int)(p_high * scale_double) + (k + 1);
+            if (k == 255) h_int = TOTAL;
+            bool match = (target >= l_int && target < h_int);
+            unsigned int ballot = __ballot_sync(0xFFFFFFFF, match);
+            if (ballot != 0) {
+                int winner = __ffs(ballot) - 1;
+                s = __shfl_sync(0xFFFFFFFF, k, winner);
+                low_s = __shfl_sync(0xFFFFFFFF, l_int, winner);
+                high_s = __shfl_sync(0xFFFFFFFF, h_int, winner);
+                break;
+            }
+        }
+
+        if (lane == 0) {
+            d_tokens[b] = s;
+            d_batch_output[b * chunk_size + t] = s;
+            unsigned int prob = high_s - low_s;
+            if (prob == 0) prob = 1;
+            st_local.lower = st_local.lower + scale_rc * (unsigned long long)low_s;
+            st_local.range = scale_rc * (unsigned long long)prob;
+            const unsigned int* in = in_words + (size_t)b * (size_t)pitch_words;
+            while (st_local.range < (1ull << (64-32))) {
+                st_local.lower <<= 32;
+                st_local.range <<= 32;
+                unsigned int w = (st_local.read_idx_words < sizes_words[b]) ? in[st_local.read_idx_words++] : 0u;
+                st_local.point = (st_local.point << 32) | (unsigned long long)w;
+            }
+            states[b] = st_local;
+        }
+    }
+}
+
+void gpu_rc_decode_fused_step_batch_graph(const float* logits, const float* head_b2, int* d_tokens, const int* lengths, const int* d_t, int* d_batch_output, int chunk_size, RCDecState* states, const unsigned int* in_bufs, const int* sizes_words, int pitch_words, int vocab_size, int batch_size) {
+    if (vocab_size != 256) {
+        printf("Error: Warp Decode requires Vocab=256\n"); return;
+    }
+    ker_rc_decode_fused_step_warp_dptr<<<batch_size, 32, 0, g_stream>>>(logits, head_b2, d_tokens, lengths, d_t, d_batch_output, chunk_size, states, in_bufs, sizes_words, pitch_words, vocab_size, batch_size);
+}
+
+// Tiny kernel to increment a device-side counter
+__global__ void ker_increment_counter(int* counter) {
+    *counter += 1;
+}
+
+void gpu_increment_counter(int* d_counter) {
+    ker_increment_counter<<<1, 1, 0, g_stream>>>(d_counter);
 }
 
 // ==========================================
@@ -596,12 +816,12 @@ __global__ void ker_store_tokens(const int* d_out_symbols, int* d_chunk_data, in
 }
 
 void gpu_select_tokens(const int* d_chunk_data, int* d_tokens, int t, int chunk_size, int batch_size) {
-    ker_select_tokens<<<(batch_size + 255)/256, 256>>>(d_chunk_data, d_tokens, t, chunk_size, batch_size);
+    ker_select_tokens<<<(batch_size + 255)/256, 256, 0, g_stream>>>(d_chunk_data, d_tokens, t, chunk_size, batch_size);
     checkCudaErrors(cudaGetLastError());
 }
 
 void gpu_store_tokens(const int* d_out_symbols, int* d_chunk_data, int t, int chunk_size, int batch_size) {
-    ker_store_tokens<<<(batch_size + 255)/256, 256>>>(d_out_symbols, d_chunk_data, t, chunk_size, batch_size);
+    ker_store_tokens<<<(batch_size + 255)/256, 256, 0, g_stream>>>(d_out_symbols, d_chunk_data, t, chunk_size, batch_size);
     checkCudaErrors(cudaGetLastError());
 }
 
@@ -635,7 +855,7 @@ __global__ void ker_rc_encode_chunk_parallel_warp(const float* logits_base, cons
 
     for (int t = start_t; t < loop_len; ++t) {
         int token = my_tokens[t+1];
-        const float* l_ptr = my_logits + t * vocab_size;
+        const float* l_ptr = my_logits + (size_t)(t - start_t) * vocab_size;
 
         // 1. Load & Max Reduction
         float my_vals[8];
@@ -655,7 +875,7 @@ __global__ void ker_rc_encode_chunk_parallel_warp(const float* logits_base, cons
         double my_sum_d = 0.0;
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            float val = __expf(my_vals[i] - batch_max); 
+            float val = __expf((my_vals[i] - batch_max) * d_inv_temperature); 
             my_vals[i] = val; 
             my_sum_d += (double)val;
         }
@@ -678,6 +898,18 @@ __global__ void ker_rc_encode_chunk_parallel_warp(const float* logits_base, cons
         }
         if (lane == 31) s_cdf[256] = 1.0; 
 
+        __syncwarp();
+
+        // Enforce CDF monotonicity at warp lane boundaries (parallel fixup)
+        if (lane > 0) {
+            double prev_end = s_cdf[lane * 8 - 1];
+            double my_start = s_cdf[lane * 8];
+            if (my_start < prev_end) {
+                double delta = prev_end - my_start;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) s_cdf[lane * 8 + i] += delta;
+            }
+        }
         __syncwarp();
 
         // 4. Encode (Lane 0 only)
@@ -743,6 +975,6 @@ void gpu_rc_encode_chunk_warp(const float* logits, const int* chunk_data, const 
     if (vocab_size != 256) {
         printf("Error: Warp Encode requires Vocab=256\n"); return;
     }
-    ker_rc_encode_chunk_parallel_warp<<<batch_size, 32>>>(logits, chunk_data, lengths, states, out_bufs, pitch_words, vocab_size, batch_size, chunk_len, max_len, start_t, logit_stride);
+    ker_rc_encode_chunk_parallel_warp<<<batch_size, 32, 0, g_stream>>>(logits, chunk_data, lengths, states, out_bufs, pitch_words, vocab_size, batch_size, chunk_len, max_len, start_t, logit_stride);
     checkCudaErrors(cudaGetLastError());
 }

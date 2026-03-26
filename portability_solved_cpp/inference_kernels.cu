@@ -32,7 +32,73 @@ __global__ void ker_relu(float* x, int N) {
 void gpu_relu(float* x, int N) {
     int block = 256;
     int grid = (N + block - 1) / block;
-    ker_relu<<<grid, block>>>(x, N);
+    ker_relu<<<grid, block, 0, g_stream>>>(x, N);
+}
+
+// ==========================================
+// SiLU (Swish) Activation — x * sigmoid(x)
+// ==========================================
+
+__global__ void ker_silu_batch(float* x, size_t total) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) {
+        #if GPU_REPRO_MATH
+        x[i] = repro_silu(x[i]);
+        #else
+        float v = x[i];
+        x[i] = v / (1.0f + expf(-v));
+        #endif
+    }
+}
+
+void gpu_silu_batch(float* x, size_t total) {
+    int grid = (int)((total + 255) / 256);
+    ker_silu_batch<<<grid, 256, 0, g_stream>>>(x, total);
+}
+
+// ==========================================
+// Batched RMSNorm (weight-only, no bias)
+// ==========================================
+
+__global__ void ker_rmsnorm_batch(float* x, const float* w, int N, size_t batch) {
+    size_t row_idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row_idx >= batch) return;
+
+    float* row = x + row_idx * N;
+
+    float sq = 0.0f;
+    int i = 0;
+    int limit = N - (N % 4);
+    for (; i < limit; i += 4) {
+        float4 v = reinterpret_cast<float4*>(row)[i/4];
+        sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    for (; i < N; ++i) {
+        float val = row[i];
+        sq += val * val;
+    }
+
+    float inv_rms = rsqrtf(sq / N + 1e-6f);
+
+    i = 0;
+    for (; i < limit; i += 4) {
+        float4 v = reinterpret_cast<float4*>(row)[i/4];
+        float4 wc = reinterpret_cast<const float4*>(w)[i/4];
+        v.x = v.x * inv_rms * wc.x;
+        v.y = v.y * inv_rms * wc.y;
+        v.z = v.z * inv_rms * wc.z;
+        v.w = v.w * inv_rms * wc.w;
+        reinterpret_cast<float4*>(row)[i/4] = v;
+    }
+    for (; i < N; ++i) {
+        row[i] = row[i] * inv_rms * w[i];
+    }
+}
+
+void gpu_rmsnorm_batch(float* x, const float* w, int N, size_t batch) {
+    int block = 256;
+    int grid = (int)((batch + block - 1) / block);
+    ker_rmsnorm_batch<<<grid, block, 0, g_stream>>>(x, w, N, batch);
 }
 
 // ==========================================
@@ -51,7 +117,7 @@ void gpu_add_bias(float* x, const float* b, int M, int N) {
     size_t total = (size_t)M * N;
     int block = 256;
     int grid = (int)((total + block - 1) / block);
-    ker_add_bias<<<grid, block>>>(x, b, N, total);
+    ker_add_bias<<<grid, block, 0, g_stream>>>(x, b, N, total);
 }
 
 // ==========================================
@@ -153,7 +219,7 @@ __global__ void ker_gelu_batch(float* x, size_t total) {
 void gpu_gelu_batch(float* x, int N, size_t batch) {
     size_t total = (size_t)N * batch;
     int grid = (int)((total+255)/256);
-    ker_gelu_batch<<<grid, 256>>>(x, total);
+    ker_gelu_batch<<<grid, 256, 0, g_stream>>>(x, total);
 }
 
 // ==========================================
@@ -214,7 +280,71 @@ void gpu_layernorm_batch(float* x, const float* w, const float* b, int N, size_t
     // Launch 1 thread per row.
     int block = 256;
     int grid = (int)((batch + block - 1) / block);
-    ker_layernorm_batch_vec4<<<grid, block>>>(x, w, b, N, batch);
+    ker_layernorm_batch_vec4<<<grid, block, 0, g_stream>>>(x, w, b, N, batch);
+}
+
+// ==========================================
+// Fused LayerNorm + Residual Save (Warp-Cooperative)
+// ==========================================
+// One warp (32 threads) per row. Saves pre-norm x to 'save' buffer,
+// then normalizes x in-place. Eliminates separate cudaMemcpyAsync.
+// Designed for d_model up to 512 (each thread handles up to 16 elements).
+
+__global__ void ker_layernorm_save_warp(float* __restrict__ x, float* __restrict__ save,
+                                        const float* __restrict__ w, const float* __restrict__ b,
+                                        int N, size_t batch) {
+    // 1 warp per row, 8 warps per block (256 threads)
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    size_t row_idx = (size_t)blockIdx.x * 8 + warp_id;
+    if (row_idx >= batch) return;
+
+    float* row = x + row_idx * N;
+    float* sav = save + row_idx * N;
+
+    // Each thread handles N/32 elements (e.g. 4 for N=128)
+    int elems_per_thread = (N + 31) / 32;
+
+    // Pass 1: copy to save buffer + compute sum and sum-of-squares
+    float local_sum = 0.0f;
+    float local_sq = 0.0f;
+    for (int e = 0; e < elems_per_thread; ++e) {
+        int idx = lane + e * 32;
+        if (idx < N) {
+            float val = row[idx];
+            sav[idx] = val;
+            local_sum += val;
+            local_sq += val * val;
+        }
+    }
+
+    // Warp reduction for sum and sq
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+        local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
+    }
+    // Broadcast from lane 0
+    float mean = __shfl_sync(0xFFFFFFFF, local_sum, 0) / (float)N;
+    float var = __shfl_sync(0xFFFFFFFF, local_sq, 0) / (float)N - mean * mean;
+    float inv_std = rsqrtf(var + 1e-5f);
+
+    // Pass 2: normalize in-place
+    for (int e = 0; e < elems_per_thread; ++e) {
+        int idx = lane + e * 32;
+        if (idx < N) {
+            float val = row[idx]; // still original value (not yet overwritten)
+            row[idx] = (val - mean) * inv_std * w[idx] + b[idx];
+        }
+    }
+}
+
+void gpu_layernorm_save_batch(float* x, float* save, const float* w, const float* b, int N, size_t batch) {
+    // 8 warps per block (256 threads), 1 warp per row
+    int block = 256;
+    int warps_per_block = 8;
+    int grid = (int)((batch + warps_per_block - 1) / warps_per_block);
+    ker_layernorm_save_warp<<<grid, block, 0, g_stream>>>(x, save, w, b, N, batch);
 }
 
 // ==========================================
@@ -231,7 +361,7 @@ __global__ void ker_add_batch(float* x, const float* y, int N, size_t total) {
 void gpu_add_batch(float* x, const float* y, int N, size_t batch) {
     size_t total = (size_t)N * batch;
     int grid = (int)((total+255)/256);
-    ker_add_batch<<<grid, 256>>>(x, y, N, total);
+    ker_add_batch<<<grid, 256, 0, g_stream>>>(x, y, N, total);
     GPU_DEVICE_SYNC();
 }
 
@@ -256,5 +386,5 @@ __global__ void ker_add_bias_softplus_batch(float* x, const float* b, int N, siz
 void gpu_add_bias_softplus_batch(float* x, const float* b, int N, size_t batch) {
     size_t total = (size_t)batch * N;
     int grid = (int)((total+255)/256);
-    ker_add_bias_softplus_batch<<<grid, 256>>>(x, b, N, total);
+    ker_add_bias_softplus_batch<<<grid, 256, 0, g_stream>>>(x, b, N, total);
 }

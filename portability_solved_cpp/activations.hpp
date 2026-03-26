@@ -28,22 +28,43 @@ HOST_DEVICE inline float repro_abs(float x) {
 // but for larger x we need range reduction.
 // e^x = 2^(x * log2(e)) = 2^k * e^r
 // Implementation adapted for strictly standard C arithmetic.
+// GPU version uses __fadd_rn/__fmul_rn intrinsics to guarantee bit-exact
+// results regardless of which kernel this is inlined into.
 HOST_DEVICE inline float repro_exp(float x) {
     #if GPU_FAST_EXP && defined(__CUDA_ARCH__)
     return __expf(x);
-    #else
-    // Clamp to avoid Infinity/NaN issues in standard use (optional)
+    #elif defined(__CUDA_ARCH__)
+    // GPU path: use intrinsics for bit-exact determinism across kernels
     if (x <= -88.0f) return 0.0f;
-    if (x >= 88.0f) x = 88.0f; // overflow protection
+    if (x >= 88.0f) x = 88.0f;
 
-    // Range reduction: x = k * ln(2) + r
-    // k = round(x / ln(2))
+    // Range reduction: k = round(x / ln(2))
+    float k_float = floorf(__fadd_rn(__fmul_rn(x, R_LOG2E), 0.5f));
+    int k = (int)k_float;
+    float r = __fadd_rn(x, -__fmul_rn(k_float, R_LN2));
+
+    // Horner evaluation of Taylor series for e^r using strict intrinsics
+    // e^r ≈ 1 + r(1 + r(0.5 + r(1/6 + r(1/24 + r(1/120 + r/720)))))
+    float t = __fadd_rn(0.008333333333f, __fmul_rn(r, 0.001388888889f));
+    t = __fadd_rn(0.041666666667f, __fmul_rn(r, t));
+    t = __fadd_rn(0.166666666667f, __fmul_rn(r, t));
+    t = __fadd_rn(0.5f, __fmul_rn(r, t));
+    t = __fadd_rn(1.0f, __fmul_rn(r, t));
+    t = __fadd_rn(1.0f, __fmul_rn(r, t));
+
+    // Reconstruct 2^k * t via IEEE754 bit manipulation
+    union { float f; int i; } u;
+    u.i = (k + 127) << 23;
+    return __fmul_rn(t, u.f);
+    #else
+    // CPU path: standard arithmetic
+    if (x <= -88.0f) return 0.0f;
+    if (x >= 88.0f) x = 88.0f;
+
     float k_float = floorf(x * R_LOG2E + 0.5f);
     int k = (int)k_float;
     float r = x - k_float * R_LN2;
 
-    // Taylor series for e^r (r is in [-0.5 ln2, 0.5 ln2])
-    // e^r = 1 + r + r^2/2! + ... + r^6/6!
     float t = 1.0f + r * (
         1.0f + r * (
             0.5f + r * (
@@ -56,48 +77,24 @@ HOST_DEVICE inline float repro_exp(float x) {
         )
     );
 
-    // Reconstruct 2^k * t
-    // using ldexp is standard lib, but might be hardware dep?
-    // standard scalbn or ldexp SHOULD be strictly defined for IEEE754
-    // but to be absolutely safe, let's just use power if strictly needed,
-    // or assume IEEE754 layout manipulation is portable enough (it usually is).
-    // Let's use std::ldexpf. It modifies exponent bits.
-    // If we want to avoid std lib:
-    // Construct float with exponent k.
-    // float 2^k:
-    // (k + 127) << 23.
-    // NOTE: This assumes IEEE754 float32 layout.
-    
-    // Union-based bit manipulation is "undefined behavior" in C++ strict aliasing sometimes, but standard in CUDA/GameDev.
-    // Let's rely on standard ldexpf for now, checking if it differs.
-    // Usually it just adds k to exponent.
-    
-    // HOWEVER, on GPU ldexpf maps to an instruction.
-    // CPU maps to an instruction.
-    // If they handle denormals differently it might differ.
-    // But for "fast" inference we usually don't hit denormals.
-    
-    // Let's implement power of 2 manually via int cast to ensure it's bit exact logic we control.
     union { float f; int i; } u;
     u.i = (k + 127) << 23; 
-    
-    // Result
     return t * u.f;
     #endif
 }
 
 // Tanh
 HOST_DEVICE inline float repro_tanh(float x) {
-    // tanh(x) = (e^2x - 1)/(e^2x + 1)
-    //         = (e^2x - 1) * (1 / (e^2x + 1))
-    // Optimization: (1 - e^-2x) / (1 + e^-2x) for positive x to avoid overflow
-    
     float abs_x = repro_abs(x);
-    if (abs_x > 10.0f) return (x > 0.0f) ? 1.0f : -1.0f; // Saturation
+    if (abs_x > 10.0f) return (x > 0.0f) ? 1.0f : -1.0f;
 
-    // Use e^{2x}
+    #ifdef __CUDA_ARCH__
+    float e2x = repro_exp(__fmul_rn(2.0f, x));
+    return __fadd_rn(e2x, -1.0f) / __fadd_rn(e2x, 1.0f);
+    #else
     float e2x = repro_exp(2.0f * x);
     return (e2x - 1.0f) / (e2x + 1.0f);
+    #endif
 }
 
 // GeLU
@@ -106,29 +103,34 @@ HOST_DEVICE inline float repro_tanh(float x) {
 #define GELU_COEFF     0.044715f
 
 HOST_DEVICE inline float repro_gelu(float x) {
+    #ifdef __CUDA_ARCH__
+    float cube = __fmul_rn(__fmul_rn(x, x), x);
+    float inner = __fmul_rn(SQRT_2_OVER_PI, __fadd_rn(x, __fmul_rn(GELU_COEFF, cube)));
+    float tanh_inner = repro_tanh(inner);
+    return __fmul_rn(0.5f, __fmul_rn(x, __fadd_rn(1.0f, tanh_inner)));
+    #else
     float cube = x * x * x;
     float inner = SQRT_2_OVER_PI * (x + GELU_COEFF * cube);
     float tanh_inner = repro_tanh(inner);
     return 0.5f * x * (1.0f + tanh_inner);
+    #endif
 }
 
 // Sigmoid
 HOST_DEVICE inline float repro_sigmoid(float x) {
-    // 1 / (1 + e^-x)
-    // Optimization: e^x / (1 + e^x) if x < 0 ?
-    // Let's stick to simple 1/(1+exp(-x)) using repro_exp
-    // repro_exp handles x <= -88 -> 0 safely.
-    
-    // If x is very large positive, exp(-x) -> 0, result -> 1.
-    // If x is very large negative, exp(-x) -> huge. 
-    // repro_exp clamps input to 88, so exp(-x) where -x > 88 becomes exp(88).
-    // so it is safe.
-    
     float ex = repro_exp(-x);
+    #ifdef __CUDA_ARCH__
+    return 1.0f / __fadd_rn(1.0f, ex);
+    #else
     return 1.0f / (1.0f + ex);
+    #endif
 }
 
 // SiLU (Swish)
 HOST_DEVICE inline float repro_silu(float x) {
+    #ifdef __CUDA_ARCH__
+    return __fmul_rn(x, repro_sigmoid(x));
+    #else
     return x * repro_sigmoid(x);
+    #endif
 }

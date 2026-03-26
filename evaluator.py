@@ -1,4 +1,5 @@
 
+import hashlib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -19,6 +20,77 @@ class CompressionEvaluator:
         self.model = model.to(device)
         self.device = device
         self.results = defaultdict(list)
+
+    @staticmethod
+    def verify_bitwise(original_file: str, decompressed_file: str,
+                       report_path: str = None) -> dict:
+        """Verify bit-exact equality between original and decompressed files.
+        
+        Returns a dict with:
+          - bit_exact: bool
+          - original_size: int
+          - decompressed_size: int  
+          - original_sha256: str
+          - decompressed_sha256: str
+          - mismatch_count: int (number of differing bytes, capped at 1M scan)
+          - first_mismatch_offset: int or None
+        
+        [Referee Minor #6]: Provides a direct bitwise equality statement with
+        checksum comparison for the lossless claim.
+        """
+        import os
+        with open(original_file, 'rb') as f:
+            orig_data = f.read()
+        with open(decompressed_file, 'rb') as f:
+            dec_data = f.read()
+
+        orig_hash = hashlib.sha256(orig_data).hexdigest()
+        dec_hash = hashlib.sha256(dec_data).hexdigest()
+        bit_exact = (orig_data == dec_data)
+
+        mismatch_count = 0
+        first_mismatch = None
+        if not bit_exact:
+            cap = min(len(orig_data), len(dec_data), 1_000_000)
+            for i in range(cap):
+                if i < len(orig_data) and i < len(dec_data):
+                    if orig_data[i] != dec_data[i]:
+                        mismatch_count += 1
+                        if first_mismatch is None:
+                            first_mismatch = i
+            # Count length difference as mismatches
+            mismatch_count += abs(len(orig_data) - len(dec_data))
+
+        result = {
+            'bit_exact': bit_exact,
+            'original_size': len(orig_data),
+            'decompressed_size': len(dec_data),
+            'original_sha256': orig_hash,
+            'decompressed_sha256': dec_hash,
+            'mismatch_count': mismatch_count,
+            'first_mismatch_offset': first_mismatch,
+        }
+
+        # Print report
+        print("\n  === Bitwise Verification Report ===")
+        print(f"  Original:     {os.path.basename(original_file)} ({len(orig_data):,} bytes)")
+        print(f"  Decompressed: {os.path.basename(decompressed_file)} ({len(dec_data):,} bytes)")
+        print(f"  SHA-256 original:     {orig_hash}")
+        print(f"  SHA-256 decompressed: {dec_hash}")
+        if bit_exact:
+            print(f"  Result: BIT-EXACT MATCH — lossless round-trip verified")
+        else:
+            print(f"  Result: MISMATCH — {mismatch_count} differing bytes")
+            if first_mismatch is not None:
+                print(f"  First mismatch at byte offset: {first_mismatch}")
+        print()
+
+        if report_path:
+            os.makedirs(os.path.dirname(report_path), exist_ok=True) if os.path.dirname(report_path) else None
+            with open(report_path, 'w') as f:
+                json.dump(result, f, indent=2)
+
+        return result
     
     def plot_bit_exact_columns(
         self,

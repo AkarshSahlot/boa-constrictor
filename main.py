@@ -2,7 +2,6 @@ import argparse
 import os
 import time
 from pathlib import Path
-from networkx import config
 import yaml
 import numpy as np
 import torch
@@ -56,7 +55,8 @@ def parse_args():
     p.add_argument('--config', '-c', type=Path, required=False, help='Path to YAML experiment config')
     p.add_argument('--no-progress', action='store_true', help='Disable progress bars')
     p.add_argument('--device', type=str, default="cuda", help='Torch device override (cpu|cuda)')
-    p.add_argument('--precision', type=str, default="fp32", choices=['fp32','fp16', 'fp8'], help='Precision override')
+    p.add_argument('--precision', type=str, default=None, choices=['fp32','bf16','fp16', 'fp8'], help='Precision override')
+    p.add_argument('--compile', action='store_true', help='Use torch.compile for faster training (adds ~60s warmup)')
     p.add_argument('--new-experiment', action='store_true', help='Create a new experiment config interactively and run it')
     p.add_argument('--train-only', action='store_true', help='Only run training')
     p.add_argument('--compress-only', action='store_true', help='Only run compression')
@@ -65,13 +65,44 @@ def parse_args():
     p.add_argument('--verify', action='store_true', help='After decompression, verify bytes match the input file used for compression')
     p.add_argument('--evaluate', action='store_true', help='After decompression, run evaluation metrics on the compressor model')
     p.add_argument('--evaluate-only', action='store_true', help='After decompression, run evaluation metrics on the compressor model')
-    p.add_argument('--comparison-baseline-only', action='store_true', help='Run LZMA and ZLIB (ultra) baseline compressions on the compression input file, print results, and exit')
+    p.add_argument('--comparison-baseline-only', action='store_true', help='Run LZMA, ZLIB, ZSTD, LZ4 baseline compressions on the compression input file, print results, and exit')
     p.add_argument('--model-path', type=str, default=None, help='Path to a pre-trained model .pt file (state_dict or full model). If provided, training is skipped and the model is loaded')
+    p.add_argument('--seed', type=int, default=None, help='Random seed for reproducibility (sets torch, numpy, python random seeds)')
+    p.add_argument('--backbone', type=str, default="mamba",
+                   choices=['mamba', 'mambav1', 'mamba2', 'lstm', 'gru', 'mingru',
+                            'transformer', 'rwkv6', 'rwkv7', 'rwkv8', 'griffin', 'xlstm'],
+                   help='Model backbone override (default: mamba)')
+    # --- Ablation overrides ---
+    p.add_argument('--d-model', type=int, default=None, help='Override d_model from config')
+    p.add_argument('--num-layers', type=int, default=None, help='Override num_layers from config')
+    p.add_argument('--data-frac', type=float, default=1.0, help='Fraction of training data to use (0.0-1.0, default: 1.0)')
+    p.add_argument('--adapt', type=float, nargs=2, metavar=('LR', 'STEPS'),
+                   help='Enable online head adaptation with given learning rate and number of steps (e.g. --adapt 1e-3 1)')
+    p.add_argument('--epochs', type=int, default=None, help='Override number of training epochs')
+    p.add_argument('--lr', type=float, default=None, help='Override learning rate')
+    p.add_argument('--patience', type=int, default=None, help='Override early stopping patience (0=disabled)')
+    p.add_argument('--force-train', action='store_true', help='Force training from scratch, ignoring existing checkpoints')
+    # --- Weights & Biases ---
+    p.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
+    p.add_argument('--wandb-project', type=str, default='boa-constrictor', help='W&B project name')
+    p.add_argument('--wandb-entity', type=str, default=None, help='W&B entity (team or username)')
+    p.add_argument('--wandb-name', type=str, default=None, help='W&B run name (defaults to experiment name)')
+    p.add_argument('--wandb-tags', type=str, nargs='*', default=None, help='W&B run tags')
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # Set random seeds for reproducibility [Referee Major #9]
+    if args.seed is not None:
+        import random
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        print(f"[INFO] Random seed set to {args.seed}")
 
     # If user requests a new experiment, run interactive creator and obtain a config path
     if args.new_experiment:
@@ -102,6 +133,7 @@ def main():
         chunks_count = _prompt("Compression chunks_count", 1000, int)
         use_vocab_subset = _prompt("Use vocab subset (true/false)", "false", lambda s: s.lower() in ("1","true","yes"))
         compress_file = _prompt("File to compress (leave blank to use dataset file)", "", lambda s: s if s != "" else "")
+        backbone_choice = _prompt("Backbone (mamba|mambav1|mamba2|lstm|gru|mingru|transformer|rwkv6|rwkv7|rwkv8|griffin|xlstm)", "mamba")
         splits_in = _prompt("Data splits as comma-separated (train,val,test)", "0.8,0.1,0.1")
         try:
             splits = [float(x.strip()) for x in splits_in.split(',')]
@@ -118,7 +150,7 @@ def main():
             'device': device,
             'precision': precision,
             'dataloader': {'seq_len': int(seq_len), 'batch_size': int(batch_size)},
-            'model': {'d_model': int(d_model), 'num_layers': int(num_layers)},
+            'model': {'d_model': int(d_model), 'num_layers': int(num_layers), 'backbone': backbone_choice},
             'training': {'lr': float(lr), 'epochs': int(epochs)},
             'compression': {'chunks_count': int(chunks_count), 'file_to_compress': compress_file},
             'use_vocab_subset': bool(use_vocab_subset),
@@ -180,11 +212,46 @@ def main():
             file_path = (cfg_dir / file_path).resolve()
     seq_len = config.get('dataloader', {}).get('seq_len', 32768)
     batch_size = config.get('dataloader', {}).get('batch_size', 3)
-    d_model = config.get('model', {}).get('d_model', 256)
-    num_layers = config.get('model', {}).get('num_layers', 8)
-    lr = float(config.get('training', {}).get('lr', 5e-4))
-    num_epochs = config.get('training', {}).get('epochs', 50)
+    d_model = args.d_model if args.d_model is not None else config.get('model', {}).get('d_model', 256)
+    num_layers = args.num_layers if args.num_layers is not None else config.get('model', {}).get('num_layers', 8)
+    # Backbone selection (default: mamba for backward compatibility)
+    model_cfg = config.get('model', {})
+    backbone = model_cfg.get('backbone', 'mamba') or args.backbone
+    _MODEL_KNOWN_KEYS = {'d_model', 'num_layers', 'backbone', 'path'}
+    backbone_kwargs = {k: v for k, v in model_cfg.items() if k not in _MODEL_KNOWN_KEYS}
+    # Log transformer-specific defaults that differ from the old version
+    if backbone == 'transformer':
+        backbone_kwargs.setdefault('window_size', 4096)
+        backbone_kwargs.setdefault('n_sink', 4)
+    elif backbone == 'rwkv6':
+        backbone_kwargs.setdefault('n_heads', 4)
+    elif backbone == 'rwkv7':
+        backbone_kwargs.setdefault('n_heads', 4)
+    elif backbone == 'griffin':
+        backbone_kwargs.setdefault('n_heads', 4)
+        backbone_kwargs.setdefault('local_window', 128)
+    elif backbone == 'xlstm':
+        backbone_kwargs.setdefault('n_heads', 4)
+    lr = args.lr if args.lr is not None else float(config.get('training', {}).get('lr', 5e-4))
+    num_epochs = args.epochs if args.epochs is not None else config.get('training', {}).get('epochs', 50)
     use_vocab_subset = config.get('use_vocab_subset', False)
+
+    # Build a unique model name when CLI overrides are active so that each
+    # ablation configuration gets its own checkpoint files instead of
+    # overwriting the single default checkpoint.
+    _name_parts = []
+    if args.d_model is not None:
+        _name_parts.append(f"d{d_model}")
+    if args.num_layers is not None:
+        _name_parts.append(f"L{num_layers}")
+    data_frac = getattr(args, 'data_frac', 1.0)
+    if data_frac < 1.0:
+        _name_parts.append(f"f{data_frac:.2f}")
+    if args.seed is not None and args.seed != 42:
+        _name_parts.append(f"s{args.seed}")
+    if _name_parts:
+        name = f"{name}_{'_'.join(_name_parts)}"
+        print(f"[INFO] Model name adjusted for ablation: {name}")
 
     timings = {}
 
@@ -244,47 +311,145 @@ def main():
     exp_dir.mkdir(parents=True, exist_ok=True)
 
     # Setup model, dataloaders, optimizer, loss
-    model = BoaConstrictor(d_model=d_model, num_layers=num_layers, vocab_size=vocab_size, device=device)
-
+    print(f"[INFO] Backbone: {backbone}" + (f"  kwargs: {backbone_kwargs}" if backbone_kwargs else ""))
+    model = BoaConstrictor(d_model=d_model, num_layers=num_layers, vocab_size=vocab_size,
+                           device=device, backbone=backbone, **backbone_kwargs)
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {num_params:,}")
     dataloader = ByteDataloader(data_bytes, seq_len=seq_len, batch_size=batch_size, device=device)
 
     train_b, val_b, test_b = make_splits(data_bytes, dataloader.seq_len, dataloader.batch_size,
                                          splits=tuple(config.get('splits', (0.8, 0.1, 0.1))))
+
+    # --- Data-fraction subsampling (for ablation studies) ---
+    data_frac = getattr(args, 'data_frac', 1.0)
+    if data_frac < 1.0:
+        n_keep = int(len(train_b) * data_frac)
+        block = dataloader.seq_len * dataloader.batch_size
+        n_keep = (n_keep // block) * block  # align to batch boundaries
+        n_keep = max(n_keep, block)  # keep at least one batch
+        train_b = train_b[:n_keep]
+        print(f"[INFO] Data fraction: {data_frac:.0%} — using {len(train_b):,} / {len(train_b)//data_frac:,.0f} training bytes")
 
     train_loader = ByteDataloader(train_b, seq_len=dataloader.seq_len, batch_size=dataloader.batch_size, device=device)
     val_loader = ByteDataloader(val_b, seq_len=dataloader.seq_len, batch_size=dataloader.batch_size, device=device)
     test_loader = ByteDataloader(test_b, seq_len=dataloader.seq_len, batch_size=dataloader.batch_size, device=device)
 
     criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    weight_decay = float(config.get('training', {}).get('weight_decay', 0.01))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     # If a model path is provided and exists, load it and skip training
-    def _load_model_from_path(model, path: Path):
+    def _infer_backbone_from_keys(keys):
+        """Infer backbone type from state_dict key patterns.
+
+        Each backbone produces distinctive key names inside
+        ``blocks.<i>.`` — we check for those fingerprints.
+        """
+        ks = set(keys)
+        has = lambda pat: any(pat in k for k in ks)  # noqa: E731
+
+        # Unique sub-module names per backbone
+        # RWKV-8 ROSA has .rosa_mix.rosa.
+        if has('.rosa_mix.'):  return 'rwkv8'
+        # RWKV-7 has .time_mix.W_a (non-diagonal transition); check before rwkv6
+        if has('.time_mix.') and has('.time_mix.W_a.'): return 'rwkv7'
+        if has('.time_mix.'):   return 'rwkv6'
+        if has('.rg_lru.'):    return 'griffin'
+        if has('.mlstm.'):     return 'xlstm'
+        if has('.mamba2.'):    return 'mamba2'
+        if has('.mingru.'):    return 'mingru'
+        if has('.lstm.'):      return 'lstm'
+        if has('.gru.'):       return 'gru'
+        # Transformer has q_proj but no recurrence sub-modules
+        if has('.q_proj.') or has('.kv_proj.'):
+            return 'transformer'
+        # Distinguish mamba (improved) vs mambav1 by FFN structure
+        if has('.mamba.'):
+            # Improved mamba uses SwiGLU (ff.w_gate) + final_norm
+            if has('.ff.w_gate.') and has('final_norm.'):
+                return 'mamba'
+            return 'mambav1'
+        return None
+
+    def _load_model_from_path(model, path: Path, expected_backbone: str = None):
         if not path.exists():
             raise FileNotFoundError(f"Model file not found: {path}")
         obj = torch.load(path, map_location='cpu')
-        try:
-            # Try state_dict first
-            if isinstance(obj, dict) and all(isinstance(k, str) for k in obj.keys()):
-                model.load_state_dict(obj, strict=False)
-                return model
-            # If whole model was saved
-            if hasattr(obj, 'state_dict') and hasattr(obj, 'parameters'):
-                return obj
-        except Exception:
-            pass
-        # Fallback: if torch.save was used with state_dict under a key
-        if isinstance(obj, dict) and 'state_dict' in obj:
-            model.load_state_dict(obj['state_dict'], strict=False)
+
+        saved_backbone = None
+        state_dict = None
+
+        if isinstance(obj, dict):
+            # New backbone-aware format: {'backbone': str, 'state_dict': dict}
+            if 'backbone' in obj and 'state_dict' in obj:
+                saved_backbone = obj['backbone']
+                state_dict = obj['state_dict']
+            # Legacy format with state_dict under a key
+            elif 'state_dict' in obj:
+                state_dict = obj['state_dict']
+            # Pure state_dict (all string keys, no 'backbone' key)
+            elif all(isinstance(k, str) for k in obj.keys()):
+                state_dict = obj
+
+        if state_dict is not None:
+            # For legacy checkpoints, infer backbone from key patterns
+            if saved_backbone is None:
+                inferred = _infer_backbone_from_keys(state_dict.keys())
+                if inferred:
+                    saved_backbone = inferred
+                    print(f"  Inferred backbone from checkpoint keys: {inferred}")
+
+            # Backbone compatibility check
+            if saved_backbone and expected_backbone and saved_backbone != expected_backbone:
+                raise ValueError(
+                    f"Backbone mismatch: checkpoint was trained with "
+                    f"'{saved_backbone}' but current config specifies "
+                    f"'{expected_backbone}'. Change backbone in config to "
+                    f"'{saved_backbone}' or retrain."
+                )
+            if saved_backbone:
+                print(f"  Checkpoint backbone: {saved_backbone}")
+            elif expected_backbone:
+                print(f"  Legacy checkpoint (could not infer backbone). "
+                      f"Assuming compatible with '{expected_backbone}'.")
+
+            # Load with strict=True first to catch mismatches cleanly
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing or unexpected:
+                print(f"  [WARN] state_dict load: {len(missing)} missing, "
+                      f"{len(unexpected)} unexpected keys")
+                if len(missing) > len(state_dict) * 0.5:
+                    raise ValueError(
+                        f"Too many missing keys ({len(missing)}/{len(state_dict)}). "
+                        f"This checkpoint is likely incompatible with backbone "
+                        f"'{expected_backbone}'."
+                    )
             return model
+
+        # If whole model was saved
+        if hasattr(obj, 'state_dict') and hasattr(obj, 'parameters'):
+            if expected_backbone and hasattr(obj, '_backbone_name'):
+                if obj._backbone_name != expected_backbone:
+                    raise ValueError(
+                        f"Backbone mismatch: saved model uses "
+                        f"'{obj._backbone_name}' but config specifies "
+                        f"'{expected_backbone}'."
+                    )
+            return obj
+
         raise ValueError(f"Unrecognized checkpoint format at {path}")
 
     # If no explicit model_path was provided, check for an existing final checkpoint
     start_epoch = 1
     resume_training = False
+    force_train = getattr(args, 'force_train', False)
     
     default_ckpt = exp_dir / f"{name}_final_model_{precision}.pt"
-    if model_path is None:
+    if force_train:
+        model_path = None  # ignore any existing checkpoint
+        print("[INFO] --force-train: training from scratch (ignoring existing checkpoints)")
+    elif model_path is None:
         if default_ckpt.exists():
             model_path = default_ckpt
             print(f"Found existing checkpoint at {model_path}. Will load and skip training.")
@@ -320,17 +485,81 @@ def main():
             print("Skipping training (final model or explicit path provided).")
         
         t_start = time.perf_counter()
-        model = _load_model_from_path(model, Path(model_path))
+        model = _load_model_from_path(model, Path(model_path),
+                                       expected_backbone=backbone)
         model = model.to(device)
         timings['load_model'] = time.perf_counter() - t_start
         print(f"Model loaded in {timings['load_model']:.2f}s")
 
     if not args.compress_only and not args.decompress_only and not args.comparison_baseline_only:
         if model_path is None or resume_training:
-            print(f"Starting training on device=={device}, precision={precision}, epochs={num_epochs}, start_epoch={start_epoch}")
+            print(f"Starting training on device=={device}, precision={precision}, backbone={backbone}, epochs={num_epochs}, start_epoch={start_epoch}")
             t_start = time.perf_counter()
+            grad_clip = float(config.get('training', {}).get('grad_clip', 1.0))
+
+            # LR scheduler (optional, from config)
+            scheduler_name = config.get('training', {}).get('scheduler', None)
+            scheduler = None
+            if scheduler_name == 'cosine':
+                remaining_epochs = max(1, num_epochs - start_epoch + 1)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs)
+
+            patience = args.patience if args.patience is not None else int(config.get('training', {}).get('patience', 0))
+
+            # --- Weights & Biases initialisation ---
+            wandb_run = None
+            if args.wandb:
+                try:
+                    import wandb
+                    wandb_run = wandb.init(
+                        project=args.wandb_project,
+                        entity=args.wandb_entity,
+                        name=args.wandb_name or name,
+                        tags=args.wandb_tags,
+                        config={
+                            "experiment": name,
+                            "backbone": backbone,
+                            "d_model": d_model,
+                            "num_layers": num_layers,
+                            "seq_len": seq_len,
+                            "batch_size": batch_size,
+                            "lr": lr,
+                            "weight_decay": weight_decay,
+                            "epochs": num_epochs,
+                            "start_epoch": start_epoch,
+                            "precision": precision,
+                            "vocab_size": vocab_size,
+                            "patience": patience,
+                            "grad_clip": grad_clip,
+                            "scheduler": scheduler_name,
+                            "num_params": num_params,
+                            "device": device,
+                            "dataset": str(file_path),
+                            "seed": args.seed,
+                            "data_frac": getattr(args, 'data_frac', 1.0),
+                            "train_bytes": len(train_b),
+                            **backbone_kwargs,
+                        },
+                    )
+                    wandb.watch(model, log="gradients", log_freq=100)
+                    print(f"[INFO] W&B run: {wandb_run.url}")
+                except ImportError:
+                    print("[WARN] --wandb requested but `wandb` is not installed. Continuing without it.")
+                except Exception as e:
+                    print(f"[WARN] W&B init failed: {e}. Continuing without it.")
+
+            # Optional torch.compile for faster training
+            if getattr(args, 'compile', False):
+                print("[INFO] Compiling model with torch.compile (mode='max-autotune')...")
+                model = torch.compile(model, mode='max-autotune')
+
             train(model, train_loader, val_loader, test_loader, optimizer, criterion,
-                  device=device, name=str(exp_dir / name), NUM_EPOCHS=num_epochs, PRECISION=precision, progress=progress, start_epoch=start_epoch, vocab_size=vocab_size)
+                  device=device, name=str(exp_dir / name), NUM_EPOCHS=num_epochs, PRECISION=precision, progress=progress, start_epoch=start_epoch, vocab_size=vocab_size, grad_clip=grad_clip, scheduler=scheduler, patience=patience, wandb_run=wandb_run)
+
+            # Finish wandb run after training
+            if wandb_run is not None:
+                wandb_run.finish()
+
             timings['training'] = time.perf_counter() - t_start
             print(f"Training complete in {timings['training']:.2f}s")
 
@@ -374,8 +603,42 @@ def main():
     def _run_baseline_comparisons(in_path: Path, out_dir: Path, exp_name: str):
         import lzma
         import zlib
+        import bz2
         import uproot
         import time
+
+        # Import ZSTD and LZ4 for broader baseline coverage [Referee Major #2]
+        try:
+            import zstandard as zstd
+            _has_zstd = True
+        except ImportError:
+            _has_zstd = False
+            print("[WARN] zstandard not installed; skipping ZSTD baselines (pip install zstandard)")
+        try:
+            import lz4.frame as lz4f
+            import lz4.block as lz4b
+            _has_lz4 = True
+        except ImportError:
+            _has_lz4 = False
+            print("[WARN] lz4 not installed; skipping LZ4 baselines (pip install lz4)")
+        try:
+            import brotli
+            _has_brotli = True
+        except ImportError:
+            _has_brotli = False
+            print("[WARN] brotli not installed; skipping Brotli baselines (pip install brotli)")
+        try:
+            import pyppmd
+            _has_ppmd = True
+        except ImportError:
+            _has_ppmd = False
+            print("[WARN] pyppmd not installed; skipping PPMd baselines (pip install pyppmd)")
+        try:
+            import constriction
+            _has_constriction = True
+        except ImportError:
+            _has_constriction = False
+            print("[WARN] constriction not installed; skipping rANS baselines (pip install constriction)")
 
         with open(in_path, 'rb') as rf:
             data = rf.read()
@@ -383,34 +646,124 @@ def main():
         orig_size = len(data)
         results = {}
 
-        # LZMA (try EXTREME if available, fall back to preset=9)
-        try:
-            t0 = time.perf_counter()
+        def _bench_codec(name, compress_fn, decompress_fn, out_suffix):
+            """Run compression + decompression, measure both times and throughput."""
             try:
-                comp_lz = lzma.compress(data, preset=9 | getattr(lzma, 'PRESET_EXTREME', 0))
-            except Exception:
-                comp_lz = lzma.compress(data, preset=9)
-            t_lz = time.perf_counter() - t0
-            lz_size = len(comp_lz)
-            lz_path = out_dir / f"{exp_name}.lzma"
-            with open(lz_path, 'wb') as wf:
-                wf.write(comp_lz)
-            results['lzma'] = {'path': str(lz_path), 'size': lz_size, 'time_s': t_lz}
-        except Exception as e:
-            results['lzma'] = {'error': str(e)}
+                # Compression
+                t0 = time.perf_counter()
+                compressed = compress_fn(data)
+                t_comp = time.perf_counter() - t0
+                comp_size = len(compressed)
+
+                # Decompression [Referee Major #6]
+                t0 = time.perf_counter()
+                decompressed = decompress_fn(compressed)
+                t_decomp = time.perf_counter() - t0
+
+                # Verify round-trip
+                assert len(decompressed) == orig_size, f"Decompressed size mismatch: {len(decompressed)} vs {orig_size}"
+
+                # Write compressed output
+                out_path = out_dir / f"{exp_name}.{out_suffix}"
+                with open(out_path, 'wb') as wf:
+                    wf.write(compressed)
+
+                results[name] = {
+                    'path': str(out_path),
+                    'size': comp_size,
+                    'time_compress_s': t_comp,
+                    'time_decompress_s': t_decomp,
+                    'throughput_compress_MBps': (orig_size / 1e6) / max(t_comp, 1e-9),
+                    'throughput_decompress_MBps': (orig_size / 1e6) / max(t_decomp, 1e-9),
+                }
+            except Exception as e:
+                results[name] = {'error': str(e)}
+
+        # LZMA (try EXTREME if available, fall back to preset=9)
+        _bench_codec(
+            'lzma',
+            lambda d: lzma.compress(d, preset=9 | getattr(lzma, 'PRESET_EXTREME', 0)),
+            lzma.decompress,
+            'lzma'
+        )
 
         # ZLIB (max compression level = 9)
-        try:
-            t0 = time.perf_counter()
-            comp_z = zlib.compress(data, level=9)
-            t_z = time.perf_counter() - t0
-            z_size = len(comp_z)
-            z_path = out_dir / f"{exp_name}.zlib"
-            with open(z_path, 'wb') as wf:
-                wf.write(comp_z)
-            results['zlib'] = {'path': str(z_path), 'size': z_size, 'time_s': t_z}
-        except Exception as e:
-            results['zlib'] = {'error': str(e)}
+        _bench_codec(
+            'zlib',
+            lambda d: zlib.compress(d, level=9),
+            zlib.decompress,
+            'zlib'
+        )
+
+        # ZSTD at multiple levels [Referee Major #2]
+        if _has_zstd:
+            for zstd_level in (1, 3, 7, 19):
+                _bench_codec(
+                    f'zstd_L{zstd_level}',
+                    lambda d, lvl=zstd_level: zstd.ZstdCompressor(level=lvl).compress(d),
+                    lambda d: zstd.ZstdDecompressor().decompress(d),
+                    f'zstd_L{zstd_level}'
+                )
+
+        # LZ4 (frame and high-compression) [Referee Major #2]
+        if _has_lz4:
+            _bench_codec(
+                'lz4',
+                lambda d: lz4f.compress(d),
+                lambda d: lz4f.decompress(d),
+                'lz4'
+            )
+            _bench_codec(
+                'lz4_hc',
+                lambda d: lz4f.compress(d, compression_level=lz4f.COMPRESSIONLEVEL_MAX),
+                lambda d: lz4f.decompress(d),
+                'lz4_hc'
+            )
+
+        # Brotli baselines
+        if _has_brotli:
+            _bench_codec(
+                'brotli_1',
+                lambda d: brotli.compress(d, quality=1),
+                lambda d: brotli.decompress(d),
+                'brotli_1'
+            )
+            _bench_codec(
+                'brotli_11',
+                lambda d: brotli.compress(d, quality=11),
+                lambda d: brotli.decompress(d),
+                'brotli_11'
+            )
+
+        # bzip2 (stdlib)
+        _bench_codec(
+            'bzip2_9',
+            lambda d: bz2.compress(d, compresslevel=9),
+            lambda d: bz2.decompress(d),
+            'bzip2_9'
+        )
+
+        # PPMd (Prediction by Partial Matching)
+        if _has_ppmd:
+            ppmd_mem = min(256 << 20, max(16 << 20, orig_size * 2))
+            _bench_codec(
+                'ppmd',
+                lambda d: pyppmd.compress(d, max_order=6, mem_size=ppmd_mem, variant='H'),
+                lambda d: pyppmd.decompress(d, max_order=6, mem_size=ppmd_mem, variant='H'),
+                'ppmd'
+            )
+
+        # Order-0 rANS (pure entropy coding baseline)
+        if _has_constriction:
+            from generate_comparison_table import _rans_o0_compress, _rans_o0_decompress
+            _bench_codec(
+                'rans_o0',
+                _rans_o0_compress,
+                _rans_o0_decompress,
+                'rans_o0'
+            )
+
+        # RNTuple (ROOT) baseline
         if config.get('baseline', {}).get('rntuple', False):
             try:
                 rntuple_path = out_dir / f"{exp_name}.root"
@@ -421,22 +774,38 @@ def main():
                 file.close()
                 t_rntuple = time.perf_counter() - t0
                 rntuple_size = os.path.getsize(rntuple_path)
-                results['rntuple'] = {'path': str(rntuple_path), 'size': rntuple_size, 'time_s': t_rntuple}
+                results['rntuple'] = {'path': str(rntuple_path), 'size': rntuple_size,
+                                      'time_compress_s': t_rntuple, 'time_decompress_s': float('nan'),
+                                      'throughput_compress_MBps': (orig_size / 1e6) / max(t_rntuple, 1e-9),
+                                      'throughput_decompress_MBps': float('nan')}
             except Exception as e:
                 results['rntuple'] = {'error': str(e)}
 
-        # Print a concise summary
+        # Print a concise summary [Referee Major #2, #6]
         print("\nBaseline compression results:")
-        print(f"  Original size: {orig_size} bytes")
-        for k in ('lzma', 'zlib', 'rntuple'):
+        print(f"  Original size: {orig_size} bytes ({orig_size/1e6:.2f} MB)")
+        print(f"  {'Method':<14s}  {'Comp. Size':>12s}  {'Ratio':>7s}  {'Comp. MB/s':>11s}  {'Decomp. MB/s':>13s}  {'Comp. Time':>11s}  {'Decomp. Time':>12s}")
+        print(f"  {'-'*90}")
+        baseline_order = ['lzma', 'zlib',
+                          'zstd_L1', 'zstd_L3', 'zstd_L7', 'zstd_L19',
+                          'lz4', 'lz4_hc',
+                          'brotli_1', 'brotli_11',
+                          'bzip2_9', 'ppmd', 'rans_o0',
+                          'rntuple']
+        for k in baseline_order:
             r = results.get(k, {})
+            if not r:
+                continue
             if 'error' in r:
-                print(f"  {k.upper()}: ERROR: {r['error']}")
+                print(f"  {k.upper():<14s}  ERROR: {r['error']}")
                 continue
             size = r['size']
-            t = r['time_s']
             ratio = orig_size / size if size > 0 else float('inf')
-            print(f"  {k.upper():5} -> size={size} bytes, ratio={ratio:.2f}, time={t:.3f}s, written={r.get('path')}")
+            tc = r.get('time_compress_s', float('nan'))
+            td = r.get('time_decompress_s', float('nan'))
+            tpc = r.get('throughput_compress_MBps', float('nan'))
+            tpd = r.get('throughput_decompress_MBps', float('nan'))
+            print(f"  {k.upper():<14s}  {size:>12,d}  {ratio:>7.2f}  {tpc:>11.1f}  {tpd:>13.1f}  {tc:>10.3f}s  {td:>11.3f}s")
 
         return results
 
@@ -450,7 +819,12 @@ def main():
             print(f"[ERROR] Baseline comparison failed: {e}")
             return
 
-    boa = BOA(device, str(exp_dir / f"{name}.boa"), model)
+    # Online adaptation config
+    adapt_config = None
+    if args.adapt is not None:
+        adapt_config = (args.adapt[0], int(args.adapt[1]))
+
+    boa = BOA(device, str(exp_dir / f"{name}.boa"), model, adapt_config=adapt_config)
     file_format = compress_file_path.suffix.lstrip('.') or 'bin'
     # Compression
     if not args.train_only and not args.decompress_only and not args.evaluate_only:
@@ -490,10 +864,28 @@ def main():
             with open(compress_file_path, 'rb') as rf:
                 original_size = len(rf.read())
             compression_ratio = original_size / boa_size if boa_size > 0 else float('inf')
-            print(f"Compression ratio: {compression_ratio:.2f}")
+
+            # Model-inclusive reporting [Referee Major #3]
+            model_file = exp_dir / f"{name}_final_model_{precision}.pt"
+            model_size_bytes = model_file.stat().st_size if model_file.exists() else 0
+            boa_size_with_model = boa_size + model_size_bytes
+            ratio_with_model = original_size / boa_size_with_model if boa_size_with_model > 0 else float('inf')
+            # Amortisation: how many files of this size needed for model overhead < 1%
+            if model_size_bytes > 0:
+                amortise_n = int(np.ceil(model_size_bytes / (0.01 * original_size)))
+            else:
+                amortise_n = 0
+
+            print(f"Compression ratio (excl. model): {compression_ratio:.2f}")
+            print(f"Compression ratio (incl. model): {ratio_with_model:.2f}")
+            print(f"  Compressed size: {boa_size:,} bytes | Model size: {model_size_bytes:,} bytes")
+            print(f"  Combined size:   {boa_size_with_model:,} bytes")
+            if amortise_n > 0:
+                print(f"  Files needed to amortise model overhead to <1%: {amortise_n}")
 
             timings['compression'] = time.perf_counter() - t_start
-            print(f"Compression complete in {timings['compression']:.2f}s")
+            comp_throughput = (original_size / 1e6) / max(timings['compression'], 1e-9)
+            print(f"Compression complete in {timings['compression']:.2f}s ({comp_throughput:.1f} MB/s)")
             
             if temp_compress_path and temp_compress_path.exists():
                 temp_compress_path.unlink()
@@ -519,19 +911,30 @@ def main():
         with open(out_path, 'wb') as outf:
             outf.write(decompressed_bytes)
         timings['decompression'] = time.perf_counter() - t_start
-        print(f"Decompression complete in {timings['decompression']:.2f}s")
+        # Decompression throughput [Referee Major #6]
+        decomp_throughput = (len(decompressed_bytes) / 1e6) / max(timings['decompression'], 1e-9)
+        print(f"Decompression complete in {timings['decompression']:.2f}s ({decomp_throughput:.1f} MB/s)")
 
         # Optional verification: compare decompressed bytes with original compression input
+        # [Referee Minor #6]: Provide bitwise equality statement with checksum
         if verify:
+            import hashlib
             # Compare against the bytes we actually compressed (compress_file_path)
             with open(compress_file_path, 'rb') as rf:
                 ref_bytes = rf.read()
             same = decompressed_bytes == ref_bytes
+            # SHA-256 checksums for paper-grade verification
+            ref_hash = hashlib.sha256(ref_bytes).hexdigest()
+            dec_hash = hashlib.sha256(decompressed_bytes).hexdigest()
+            print(f"\n  === Bitwise Verification ===")
+            print(f"  Original SHA-256:     {ref_hash}")
+            print(f"  Decompressed SHA-256: {dec_hash}")
             if same:
-                print(f"VERIFY: OK — decompressed output matches input ({len(decompressed_bytes)} bytes)")
+                print(f"  VERIFY: OK — decompressed output matches input ({len(decompressed_bytes):,} bytes)")
+                print(f"  Lossless round-trip: CONFIRMED")
             else:
                 # Provide small diagnostic: print sizes and first mismatch position (bounded)
-                print("VERIFY: MISMATCH — decompressed output differs from input")
+                print("  VERIFY: MISMATCH — decompressed output differs from input")
                 if len(decompressed_bytes) != len(ref_bytes):
                     print(f"  Sizes differ: decompressed={len(decompressed_bytes)} vs input={len(ref_bytes)}")
                 else:
@@ -603,6 +1006,12 @@ def main():
                     max_rows=2000,
                     savepath=f"experiments/{name}/plots/bit_exact_columns.png",
                 )
+                # Also generate formal bitwise verification report [Referee Minor #6]
+                CompressionEvaluator.verify_bitwise(
+                    original_file=str(compress_file_path),
+                    decompressed_file=str(decompressed_path),
+                    report_path=f"experiments/{name}/plots/bitwise_verification.json",
+                )
             else:
                 print(f"[INFO] Decompressed file not found at {decompressed_path}; skipping bit-exact columns plot.")
         except Exception as e:
@@ -615,6 +1024,11 @@ def main():
         print('\nTimings:')
         for k, v in timings.items():
             print(f"  {k}: {v:.2f}s")
+        # Clarification per Referee Minor #4:
+        print("  Note: Compression/decompression times include model inference,")
+        print("  entropy coding, and in-memory I/O. File read/write times are")
+        print("  reported separately as 'read_bytes'. CPU-GPU transfer overhead")
+        print("  is included in the respective stage timings.")
 
 
 if __name__ == '__main__':

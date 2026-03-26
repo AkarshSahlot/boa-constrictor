@@ -4,7 +4,15 @@ import os
 import numpy as np
 import torch
 
-def BOA(device, filepath: str, model):
+# Online head adaptation (test-time training of prediction head)
+try:
+    from online_adapt import HeadAdapter
+    _HAS_ADAPT = True
+except ImportError:
+    _HAS_ADAPT = False
+
+
+def BOA(device, filepath: str, model, adapt_config=None):
     IS_CUDA = device == "cuda" and torch.cuda.is_available()
 
     if IS_CUDA:
@@ -46,7 +54,7 @@ def BOA(device, filepath: str, model):
 
     class BoaFile:
         MAGIC = b'BOA2'
-        IDX   = b'IDX1'
+        IDX   = b'IDX2'
         VERSION = 1
 
         def __init__(self, filepath: str, model):
@@ -105,9 +113,9 @@ def BOA(device, filepath: str, model):
                 idx = bytearray()
                 idx += self.IDX
                 idx += bytes(first_bytes)  # n bytes
-                prev = 0
-                for o in offsets: idx += _uvarint_encode(o - prev); prev = o
-                for c in compressed_list: idx += _uvarint_encode(len(c))
+                # IDX2: only lengths (offsets reconstructed as cumulative sum)
+                for L in lengths:
+                    idx += _uvarint_encode(L)
                 crc = zlib.crc32(idx) & 0xFFFFFFFF
                 f.write(idx); f.write(struct.pack('<I', crc))
 
@@ -127,20 +135,33 @@ def BOA(device, filepath: str, model):
             _fp = bytes(mm[p:p+hlen]); p += hlen
 
             crc = struct.unpack_from('<I', mm, len(mm)-4)[0]
-            idx_pos = data.rfind(self.IDX)
+            # Support both IDX1 and IDX2
+            idx_pos_2 = data.rfind(b'IDX2')
+            idx_pos_1 = data.rfind(b'IDX1')
+            idx_pos = max(idx_pos_2, idx_pos_1)
             if idx_pos < 0: raise ValueError("Index not found")
+            idx_ver = 2 if idx_pos == idx_pos_2 else 1
             if (zlib.crc32(data[idx_pos:len(data)-4]) & 0xFFFFFFFF) != crc:
                 raise ValueError("Bad index CRC")
 
-            q = idx_pos + len(self.IDX)
+            q = idx_pos + 4  # skip IDXn tag
             first_bytes = list(mm[q:q+n]); q += n
 
-            offsets = [0]*n; pos = q; prev = 0
-            for i in range(n):
-                d, pos = _uvarint_decode(mm, pos); prev += d; offsets[i] = prev
-            comp_lens = [0]*n
-            for i in range(n):
-                L, pos = _uvarint_decode(mm, pos); comp_lens[i] = L
+            if idx_ver == 1:
+                offsets = [0]*n; pos = q; prev = 0
+                for i in range(n):
+                    d, pos = _uvarint_decode(mm, pos); prev += d; offsets[i] = prev
+                comp_lens = [0]*n
+                for i in range(n):
+                    L, pos = _uvarint_decode(mm, pos); comp_lens[i] = L
+            else:
+                # IDX2: only lengths, reconstruct offsets
+                comp_lens = [0]*n; pos = q
+                for i in range(n):
+                    L, pos = _uvarint_decode(mm, pos); comp_lens[i] = L
+                offsets = [0]*n; off = 0
+                for i in range(n):
+                    offsets[i] = off; off += comp_lens[i]
 
             payload = mm[p:idx_pos]
             compressed_list = [bytes(payload[offsets[i]: offsets[i]+comp_lens[i]]) for i in range(n)]
@@ -218,6 +239,14 @@ def BOA(device, filepath: str, model):
                     except Exception:
                         print(f"[compress] streams={gpu_streams}")
 
+                # Online head adaptation: adapt the prediction head between batches
+                adapter = None
+                if _HAS_ADAPT and adapt_config is not None:
+                    _lr, _K = adapt_config
+                    adapter = HeadAdapter(self.model, lr=_lr, adapt_steps=_K)
+                    if progress:
+                        print(f"[compress] Online head adaptation enabled (lr={_lr}, K={_K})")
+
                 # Process chunks in GPU batches to reduce H2D overhead
                 for batch_start in range(0, n_chunks, gpu_streams):
                     batch_end = min(batch_start + gpu_streams, n_chunks)
@@ -248,18 +277,23 @@ def BOA(device, filepath: str, model):
                         off += len(comp_bytes)
                     first_bytes.extend(int(b) & 0xFF for b in fb_batch)
 
-                # Build and write index
+                    # Adapt head on the batch we just compressed
+                    if adapter is not None:
+                        adapter.adapt_on_batch(x_list, device=device)
+
+                # Build and write index (IDX2: only lengths, no offsets)
                 idx = bytearray()
                 idx += self.IDX
                 idx += bytes(first_bytes)  # n bytes
-                prev = 0
-                for o in offsets:
-                    idx += _uvarint_encode(o - prev); prev = o
                 for L in lengths:
                     idx += _uvarint_encode(L)
                 crc = zlib.crc32(idx) & 0xFFFFFFFF
                 f_out.write(idx)
                 f_out.write(struct.pack('<I', crc))
+
+                # Restore head to original state so decompress starts identically
+                if adapter is not None:
+                    adapter.restore_head()
 
             # Update object state (do not keep compressed payload in RAM)
             self.compressed_data = []
@@ -292,6 +326,14 @@ def BOA(device, filepath: str, model):
                 except Exception:
                     print(f"[decompress] streams={gpu_streams}")
 
+            # Online head adaptation for decompression (must mirror encoder)
+            adapter = None
+            if _HAS_ADAPT and adapt_config is not None:
+                _lr, _K = adapt_config
+                adapter = HeadAdapter(self.model, lr=_lr, adapt_steps=_K)
+                if progress:
+                    print(f"[decompress] Online head adaptation enabled (lr={_lr}, K={_K})")
+
             out_parts: list[bytes] = []
             for batch_start in range(0, n, gpu_streams):
                 batch_end = min(batch_start + gpu_streams, n)
@@ -302,8 +344,17 @@ def BOA(device, filepath: str, model):
                 decoded_list = decompress(
                     self.model, comp_u32_batch, lens_batch, fb_batch, device=device, progress=progress
                 )
+                # Adapt head on the batch we just decompressed (mirrors encoder)
+                if adapter is not None:
+                    byte_seqs = [torch.from_numpy(d.flatten()).unsqueeze(0) for d in decoded_list]
+                    adapter.adapt_on_batch(byte_seqs, device=device)
+
                 for d in decoded_list:
                     out_parts.append(d.tobytes() if hasattr(d, "tobytes") else bytes(d))
+
+            # Restore head to original state (clean up after decompression)
+            if adapter is not None:
+                adapter.restore_head()
 
             return b"".join(out_parts)
 

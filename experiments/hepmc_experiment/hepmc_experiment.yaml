@@ -7,16 +7,19 @@ dataloader:
 device: cuda
 file_path: hepmc_200m.hepmc
 model:
+  backbone: mambav1
   d_model: 256
   num_layers: 1
+model_path: hepmc_experiment_final_model_fp16.pt
 name: hepmc_experiment
-precision: fp32
+precision: fp16
 progress: true
 splits:
 - 0.8
 - 0.1
 - 0.1
 training:
-  epochs: 10
+  epochs: 30
   lr: 0.0005
+  scheduler: cosine
 use_vocab_subset: false

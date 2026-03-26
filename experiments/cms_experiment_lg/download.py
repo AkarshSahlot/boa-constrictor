@@ -1,21 +1,29 @@
 """
-Download a CMS NANOAOD file via the CERN OpenData index, extract the first N events,
-encode the selected branches into a padded float64 .bin buffer with a JSON sidecar,
-reconstruct a ROOT file from the buffer, and compare against the original for equality.
+Download a CMS NANOAOD file via the CERN OpenData index, extract events,
+and produce two ~6 GB compressible binary representations plus 200 MB
+training chunks:
 
-Usage (defaults target the provided OpenData record and 50k events):
-  python download.py \
-	--out-dir ./ \
-	--nmax 50000 \
-	--bin-out cms_50k_padded.bin
+  1) Row-major:  cms_rowmajor.bin  (~6 GB) + cms_rowmajor_200m.bin  (200 MB)
+     Events written in chunks; each event stores all branches sequentially
+     (counts + values for jagged, native dtype for scalars).
+
+  2) Col-major:  cms_colmajor.bin  (~6 GB) + cms_colmajor_200m.bin  (200 MB)
+     Each branch stored contiguously across all events (counts then values
+     for jagged branches).
+
+Additionally creates the original padded float64 row-major matrix
+(cms_50k_padded.bin) for backward compatibility.
+
+Usage:
+  python download.py --out-dir ./ --extract-formats
 
 Artifacts written to out-dir:
-  - cms.root: local reference to original file (symlink or note with URL) if available
-  - cms_firstN.root: ROOT with the first N events (subset of branches)
-  - cms_50k_padded.bin: raw float64 matrix, row-major (N x total_columns)
-  - cms_50k_padded.meta.json: metadata for reconstruction (schema, lengths, offsets)
-  - cms_roundtrip.root: reconstructed ROOT from bin+meta
-  - compare_report.txt: summary of comparison across branches
+  - cms.root: downloaded ROOT file
+  - cms_50k_padded.bin: padded float64 matrix (legacy, 50k events)
+  - cms_rowmajor.bin + .meta.json: full row-major binary (~6 GB)
+  - cms_rowmajor_200m.bin: 200 MB training chunk
+  - cms_colmajor.bin + .meta.json: full col-major binary (~6 GB)
+  - cms_colmajor_200m.bin: 200 MB training chunk
 """
 
 from __future__ import annotations
@@ -281,6 +289,188 @@ def compare_trees(original: ak.Array, reconstructed: ak.Array, selected: List[st
 	return ok, report
 
 
+def extract_rowmajor_binary(tree, nmax, out_bin, out_meta, chunk_size=50_000):
+    """Extract ROW-MAJOR binary: events written in chunks, all branches per event.
+
+    For each chunk of events, writes each branch's data: scalar branches as
+    native-dtype arrays, jagged branches as int32 counts + flattened native-dtype
+    values. This gives a ~6 GB file for a full CMS NANOAOD file.
+
+    Also creates a 200 MB training chunk (first 200 MiB of the output).
+    """
+    n_entries = min(nmax, tree.num_entries) if nmax > 0 else tree.num_entries
+
+    # Determine branch types from a sample
+    sample = tree.arrays(entry_stop=min(1000, n_entries), library="ak")
+    branch_names = sample.fields
+    schema = []
+    for bname in branch_names:
+        a = sample[bname]
+        try:
+            ak.num(a, axis=1)
+            is_jagged = True
+            flat = ak.to_numpy(ak.ravel(a))
+            dtype_str = str(flat.dtype)
+        except Exception:
+            is_jagged = False
+            try:
+                flat = ak.to_numpy(a)
+                dtype_str = str(flat.dtype)
+            except Exception:
+                continue
+        schema.append({"name": bname, "is_jagged": is_jagged, "dtype": dtype_str})
+
+    print(f"[row-major] {len(schema)} branches, {n_entries} events")
+    total_bytes = 0
+    with open(out_bin, "wb") as f:
+        for start in range(0, n_entries, chunk_size):
+            stop = min(start + chunk_size, n_entries)
+            arrs = tree.arrays(
+                filter_name=[s["name"] for s in schema],
+                entry_start=start, entry_stop=stop, library="ak",
+            )
+            for s in schema:
+                a = arrs[s["name"]]
+                dtype = np.dtype(s["dtype"])
+                if s["is_jagged"]:
+                    counts = ak.to_numpy(ak.num(a, axis=1)).astype(np.int32)
+                    flat = ak.to_numpy(ak.ravel(a)).astype(dtype)
+                    f.write(counts.tobytes())
+                    f.write(flat.tobytes())
+                    total_bytes += len(counts.tobytes()) + len(flat.tobytes())
+                else:
+                    arr = ak.to_numpy(a).astype(dtype)
+                    f.write(arr.tobytes())
+                    total_bytes += len(arr.tobytes())
+            pct = stop / n_entries * 100
+            print(f"  [{stop}/{n_entries}] {pct:.0f}% — {total_bytes / 1048576:.1f} MB written", end="\r")
+    print()
+
+    meta_obj = {"format": "row-major", "n_entries": n_entries, "total_bytes": total_bytes, "schema": schema}
+    with open(out_meta, "w") as f:
+        json.dump(meta_obj, f, indent=2)
+
+    print(f"[row-major] Output: {out_bin} ({total_bytes:,} bytes, {total_bytes/1048576:.1f} MB)")
+
+    # 200 MB training chunk
+    trunc = os.path.splitext(out_bin)[0] + "_200m" + os.path.splitext(out_bin)[1]
+    limit = 200 * 1024 * 1024
+    with open(out_bin, "rb") as src, open(trunc, "wb") as dst:
+        remaining = limit
+        while remaining > 0:
+            chunk = src.read(min(1 << 20, remaining))
+            if not chunk:
+                break
+            dst.write(chunk)
+            remaining -= len(chunk)
+    print(f"[row-major] Training chunk: {trunc} ({os.path.getsize(trunc)/1048576:.1f} MB)")
+    return total_bytes
+
+
+def extract_colmajor_binary(tree, nmax, out_bin, out_meta):
+    """Extract COLUMN-MAJOR binary: each branch contiguous for ALL events.
+
+    Stores [branch0_all_events][branch1_counts_all][branch1_values_all]...
+    This gives a ~6 GB file for a full CMS NANOAOD file.
+
+    Also creates a 200 MB training chunk (first 200 MiB of the output).
+    """
+    n_entries = min(nmax, tree.num_entries) if nmax > 0 else tree.num_entries
+
+    sample = tree.arrays(entry_stop=min(1000, n_entries), library="ak")
+    branch_names = sample.fields
+    schema = []
+    for bname in branch_names:
+        a = sample[bname]
+        try:
+            ak.num(a, axis=1)
+            is_jagged = True
+            flat = ak.to_numpy(ak.ravel(a))
+            dtype_str = str(flat.dtype)
+        except Exception:
+            is_jagged = False
+            try:
+                flat = ak.to_numpy(a)
+                dtype_str = str(flat.dtype)
+            except Exception:
+                continue
+        schema.append({"name": bname, "is_jagged": is_jagged, "dtype": dtype_str})
+
+    print(f"[col-major] {len(schema)} branches, {n_entries} events")
+    total_bytes = 0
+    with open(out_bin, "wb") as f:
+        for i, s in enumerate(schema):
+            arr = tree.arrays(filter_name=[s["name"]], entry_stop=n_entries, library="ak")[s["name"]]
+            dtype = np.dtype(s["dtype"])
+            if s["is_jagged"]:
+                counts = ak.to_numpy(ak.num(arr, axis=1)).astype(np.int32)
+                flat = ak.to_numpy(ak.ravel(arr)).astype(dtype)
+                cb = counts.tobytes()
+                vb = flat.tobytes()
+                f.write(cb)
+                f.write(vb)
+                s["counts_bytes"] = len(cb)
+                s["values_bytes"] = len(vb)
+                total_bytes += len(cb) + len(vb)
+            else:
+                values = ak.to_numpy(arr).astype(dtype)
+                buf = values.tobytes()
+                f.write(buf)
+                s["values_bytes"] = len(buf)
+                s["counts_bytes"] = 0
+                total_bytes += len(buf)
+            s["offset"] = total_bytes - s.get("counts_bytes", 0) - s["values_bytes"]
+            pct = (i + 1) / len(schema) * 100
+            print(f"  [{i+1}/{len(schema)}] {pct:5.1f}% cumul: {total_bytes/1048576:.1f} MB", end="\r")
+    print()
+
+    meta_obj = {"format": "column-major", "n_entries": n_entries, "total_bytes": total_bytes, "n_branches": len(schema), "schema": schema}
+    with open(out_meta, "w") as f:
+        json.dump(meta_obj, f, indent=2)
+
+    print(f"[col-major] Output: {out_bin} ({total_bytes:,} bytes, {total_bytes/1048576:.1f} MB)")
+
+    # Create representative 200 MB training chunk — proportional prefix of each column
+    # (NOT naive first-200MB truncation, which would only cover a few branches)
+    trunc = os.path.splitext(out_bin)[0] + "_200m" + os.path.splitext(out_bin)[1]
+    target = 200 * 1024 * 1024
+    ratio = target / total_bytes
+    print(f"[col-major] Creating representative 200 MB chunk (ratio={ratio:.4f}, all {len(schema)} branches)...")
+    written = 0
+    file_offset = 0
+    with open(out_bin, "rb") as src, open(trunc, "wb") as dst:
+        for s in schema:
+            cb = s.get("counts_bytes", 0)
+            vb = s["values_bytes"]
+            dtype = np.dtype(s["dtype"])
+            elem_size = dtype.itemsize
+
+            if s["is_jagged"]:
+                n_events_total = cb // 4
+                n_events_take = max(1, int(n_events_total * ratio))
+                take_cb = n_events_take * 4
+                src.seek(file_offset)
+                all_counts = np.frombuffer(src.read(cb), dtype=np.int32)
+                taken_counts = all_counts[:n_events_take]
+                take_vb = int(taken_counts.sum()) * elem_size
+                dst.write(taken_counts.tobytes())
+                src.seek(file_offset + cb)
+                dst.write(src.read(take_vb))
+                written += take_cb + take_vb
+                file_offset += cb + vb
+            else:
+                n_events_total = vb // elem_size
+                n_events_take = max(1, int(n_events_total * ratio))
+                take_bytes = n_events_take * elem_size
+                src.seek(file_offset)
+                dst.write(src.read(take_bytes))
+                written += take_bytes
+                file_offset += vb
+
+    print(f"[col-major] Training chunk: {trunc} ({written/1048576:.1f} MB, all {len(schema)} branches)")
+    return total_bytes
+
+
 def write_rntuple_from_awkward(path, name, arrs, compression=uproot.ZSTD(7), chunk=100_000):
     # arrs: awkward record array with fields as scalars or jagged lists
     with uproot.recreate(path, compression=compression) as f:
@@ -305,6 +495,10 @@ def main():
 	parser.add_argument("--bin-out", default="cms_50k_padded.bin", help="Output .bin filename (float64 matrix)")
 	parser.add_argument("--meta-out", default=None, help="Output metadata JSON filename (default: bin name + .meta.json)")
 
+	# Full-size extraction: row-major and column-major ~6 GB binaries
+	parser.add_argument("--extract-formats", action="store_true",
+	                    help="Also extract full-size row-major and col-major binaries (~6 GB each) with 200 MB training chunks")
+
 	# Validation path: take an external decompressed bin and fit/verify against original
 	parser.add_argument("--validate-bin", action="store_true", help="Validate an external decompressed .bin against the original ROOT")
 	parser.add_argument("--decompressed-bin", default=None, help="Path to decompressed .bin produced by another algorithm")
@@ -313,9 +507,10 @@ def main():
 
 	args = parser.parse_args()
 
-	# Default behavior: if neither mode specified, run the creation path
-	if not args.create_bin and not args.validate_bin:
+	# Default behavior: if neither mode specified, run the creation path + extract formats
+	if not args.create_bin and not args.validate_bin and not args.extract_formats:
 		args.create_bin = True
+		args.extract_formats = True
 
 	ensure_dir(args.out_dir)
 
@@ -400,6 +595,31 @@ def main():
 		if not ok:
 			# Do not exit immediately; user may also want to run validation in same call
 			print("[create-bin] WARNING: Round-trip mismatch detected.")
+
+	# FULL-SIZE FORMAT EXTRACTION PATH
+	if args.extract_formats:
+		print("\n=== Extracting full-size row-major and column-major binaries ===")
+		nmax_full = tree.num_entries  # Use ALL events
+
+		# Row-major
+		rm_bin = os.path.join(args.out_dir, "cms_rowmajor.bin")
+		rm_meta = os.path.join(args.out_dir, "cms_rowmajor.meta.json")
+		if os.path.exists(rm_bin):
+			print(f"[extract] Row-major already exists: {rm_bin} ({os.path.getsize(rm_bin)/1073741824:.1f} GB) — skipping")
+		else:
+			t0 = time.perf_counter()
+			extract_rowmajor_binary(tree, nmax_full, rm_bin, rm_meta)
+			print(f"  Time: {time.perf_counter()-t0:.1f}s")
+
+		# Column-major
+		cm_bin = os.path.join(args.out_dir, "cms_colmajor.bin")
+		cm_meta = os.path.join(args.out_dir, "cms_colmajor.meta.json")
+		if os.path.exists(cm_bin):
+			print(f"[extract] Col-major already exists: {cm_bin} ({os.path.getsize(cm_bin)/1073741824:.1f} GB) — skipping")
+		else:
+			t0 = time.perf_counter()
+			extract_colmajor_binary(tree, nmax_full, cm_bin, cm_meta)
+			print(f"  Time: {time.perf_counter()-t0:.1f}s")
 
 	# VALIDATION PATH
 	if args.validate_bin:

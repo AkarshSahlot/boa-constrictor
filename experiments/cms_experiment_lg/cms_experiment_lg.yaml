@@ -9,16 +9,19 @@ dataloader:
 device: cuda
 file_path: cms_50k_padded_200m.bin
 model:
-  d_model: 256
-  num_layers: 1
-model_path: cms_experiment_lg_final_model_fp32.pt
+  backbone: mambav1
+  d_model: 128
+  num_layers: 2
+model_path: cms_experiment_lg_final_model_bf16.pt
 name: cms_experiment_lg
-precision: fp32
+precision: bf16
 progress: true
 splits:
 - 0.8
 - 0.1
 - 0.1
 training:
-  epochs: 10
+  epochs: 20
+  grad_clip: 1.0
   lr: 0.0005
+  scheduler: cosine

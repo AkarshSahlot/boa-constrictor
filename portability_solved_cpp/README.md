@@ -4,12 +4,12 @@
 
 ### Ubuntu / Linux
 ```bash
-nvcc -o boa_constrictor boa.cpp gemm_kernels.cu inference_kernels.cu mamba_kernels.cu range_coder_kernels.cu utility_kernels.cu -I src -O3 -std=c++17 -DENABLE_GPU -DGPU_DEBUG_LOGITS=0 -DGPU_FAST_EXP=0
+nvcc -o boa_constrictor boa.cpp gemm_kernels.cu inference_kernels.cu mamba_kernels.cu rnn_kernels.cu range_coder_kernels.cu utility_kernels.cu -I src -O3 -std=c++17 --fmad=false -DENABLE_GPU -DGPU_DEBUG_LOGITS=0 -DGPU_FAST_EXP=0
 ```
 
 ### Windows
 ```powershell
-nvcc -o boa_constrictor.exe boa.cpp gemm_kernels.cu inference_kernels.cu mamba_kernels.cu range_coder_kernels.cu utility_kernels.cu -I src -O3 -std=c++17 -DENABLE_GPU -DGPU_DEBUG_LOGITS=0 -DGPU_FAST_EXP=0
+nvcc -o boa_constrictor.exe boa.cpp gemm_kernels.cu inference_kernels.cu mamba_kernels.cu rnn_kernels.cu range_coder_kernels.cu utility_kernels.cu -I src -O3 -std=c++17 --fmad=false -DENABLE_GPU -DGPU_DEBUG_LOGITS=0 -DGPU_FAST_EXP=0
 ```
 
 ## Model Weights Conversion
@@ -20,11 +20,18 @@ Before running the C++ implementation, you must convert the PyTorch model weight
 python convert_boa_weights.py --model path/to/model.pt --output model.bin
 ```
 
+The backbone type is auto-detected from the model's state dict keys. You can also specify it explicitly:
+```bash
+python convert_boa_weights.py --model path/to/lstm_model.pt --output model.bin --backbone lstm
+```
+
+Supported backbones: `mamba`, `mambav1`, `lstm`, `gru`, `mingru`
+
 ## How to Run
 
 Basic usage format:
 ```
-./boa_constrictor <mode> <model> <input> <output> [d_model] [n_layers] [--gpu-batch B] [--max-chunks C] [--chunk-size S]
+./boa_constrictor <mode> <model> <input> <output> [d_model] [n_layers] [--backbone TYPE] [--gpu-batch B] [--max-chunks C] [--chunk-size S]
 ```
 
 ### Arguments
@@ -34,6 +41,7 @@ Basic usage format:
 - `output`: Output file path
 - `d_model`: Model dimension (optional, default: 256)
 - `n_layers`: Number of layers (optional, default: 1)
+- `--backbone`: Backbone architecture: `mamba` (default), `lstm`, `gru`, `mingru`
 - `--gpu-batch`: Batch size for GPU processing
 - `--chunk-size`: Size of chunks for processing
 - `--max-chunks`: Maximum number of chunks to process (for testing)

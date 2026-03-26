@@ -7,6 +7,7 @@ dataloader:
 device: cuda
 file_path: atlas_200m.bin
 model:
+  backbone: mambav1
   d_model: 256
   num_layers: 1
 model_path: atlas_experiment_final_model_fp32.pt

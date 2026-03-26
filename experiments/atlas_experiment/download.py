@@ -218,6 +218,49 @@ def save_200m(out_bin: str) -> None:
             dst.write(chunk)
             remaining -= len(chunk)
 
+
+def extract_colmajor(h5_path: str, meta_path: str, out_bin: str, out_200m: str) -> None:
+    """Extract column-major binary from ATLAS HDF5 jets dataset.
+
+    Each field's values are written contiguously across all jets, giving a
+    column-oriented layout. Also creates a 200 MB training chunk.
+    """
+    with open(meta_path) as f:
+        meta = json.load(f)
+    fields = meta["dtype_descr"]
+    n_jets = meta["shape"][0]
+
+    print(f"[col-major] ATLAS jets: {n_jets:,} jets, {len(fields)} fields")
+
+    with h5py.File(h5_path, "r") as hf:
+        ds = hf["jets"]
+        total_bytes = 0
+        with open(out_bin, "wb") as f_out:
+            for i, (name, dt) in enumerate(fields):
+                col = np.array(ds[name])
+                raw = col.tobytes()
+                f_out.write(raw)
+                total_bytes += len(raw)
+                print(f"  [{i:2d}] {name:45s}  {dt}  {col.dtype.itemsize}B × {len(col):,} = {len(raw):,} bytes")
+
+    print(f"[col-major] Wrote {out_bin}: {total_bytes:,} bytes ({total_bytes/1e6:.1f} MB)")
+
+    # Create shuffled 200 MB training sample
+    rng = np.random.default_rng(42)
+    bytes_per_jet = sum(np.dtype(dt).itemsize for _, dt in fields)
+    target_jets = 200_000_000 // bytes_per_jet
+    indices = rng.permutation(n_jets)[:target_jets]
+
+    with h5py.File(h5_path, "r") as hf:
+        ds = hf["jets"]
+        with open(out_200m, "wb") as f_out:
+            for name, dt in fields:
+                col = np.array(ds[name])[indices]
+                f_out.write(col.tobytes())
+
+    print(f"[col-major] Training chunk: {out_200m} ({os.path.getsize(out_200m)/1048576:.1f} MB)")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="ATLAS jets round-trip helper")
     p.add_argument("--src", default=EOS_ROOT, help="Source HDF5 (root:// or https:// or local path)")
@@ -227,15 +270,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--meta", default="atlas.meta.json", help="Metadata JSON filename")
     p.add_argument("--recon-h5", default="atlas_reconstructed.h5", help="Reconstructed HDF5 output filename")
     p.add_argument("--download", action="store_true", help="Download the HDF5 if missing")
-    p.add_argument("--extract", action="store_true", help="Extract 'jets' to NPZ and BIN+META")
+    p.add_argument("--extract", action="store_true", help="Extract 'jets' to BIN+META (row-major)")
+    p.add_argument("--extract-colmajor", action="store_true", help="Also extract column-major binary + 200 MB chunk")
     p.add_argument("--reconstruct", action="store_true", help="Reconstruct HDF5 from BIN+META")
     p.add_argument("--compare", action="store_true", help="Compare original HDF5 vs reconstructed")
-    p.add_argument("--all-steps", action="store_true", help="Run download, extract, reconstruct, compare")
+    p.add_argument("--all-steps", action="store_true", help="Run download, extract (row+col), reconstruct, compare")
     args = p.parse_args(argv)
 
     if args.all_steps:
         args.download = True
         args.extract = True
+        args.extract_colmajor = True
         args.reconstruct = True
         args.compare = True
 
@@ -252,6 +297,13 @@ def main(argv: list[str] | None = None) -> int:
         # save_npz(arr, args.npz)
         save_bin(args.bin_path)
         save_200m(args.bin_path.replace(".bin", "_200m.bin"))
+
+    if args.extract_colmajor:
+        extract_colmajor(
+            args.h5, args.meta,
+            "atlas_colmajor.bin", "atlas_colmajor_200m.bin",
+        )
+
     if args.reconstruct:
         reconstruct_h5_from_bin(args.bin_path, args.recon_h5)
 
