@@ -14,6 +14,10 @@
 #include "boa_gpu.hpp"
 #include "gemm_gpu.hpp" 
 
+#ifdef ENABLE_ENERGY
+#include "cppJoules.h"
+#endif
+
 void gpu_select_tokens(const int* d_chunk_data, int* d_tokens, int t, int chunk_size, int batch_size);
 void gpu_store_tokens(const int* d_out_symbols, int* d_chunk_data, int t, int chunk_size, int batch_size);
 
@@ -21,6 +25,7 @@ void gpu_store_tokens(const int* d_out_symbols, int* d_chunk_data, int t, int ch
 
 bool g_show_timings = false;
 bool g_no_graph = false;
+bool g_measure_energy = false;
 
 void print_progress(int current, int total, double elapsed_sec, size_t total_bytes, const std::string& prefix = "") {
     float percent = (float)current / total;
@@ -273,6 +278,14 @@ static Boa2Container read_boa2(const std::string& path) {
 
 // Compress V2
 void compress_v2(const std::string& model_path, const std::string& input_path, const std::string& output_path, MambaConfig config, int max_chunks, int gpu_batch, size_t chunk_size, bool warm_start, int tile_size = 0) {
+#ifdef ENABLE_ENERGY
+    EnergyTracker* energy_tracker = nullptr;
+    if (g_measure_energy) {
+        energy_tracker = new EnergyTracker();
+        energy_tracker->start();
+        std::cout << "[energy] Started energy measurement for compression" << std::endl;
+    }
+#endif
     std::cout << "Loading Data..." << std::endl;
     std::ifstream fin(input_path, std::ios::binary);
     std::vector<uint8_t> data((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
@@ -492,6 +505,19 @@ void compress_v2(const std::string& model_path, const std::string& input_path, c
         std::cout << "Timing (s): H2D=" << t_h2d << " Compute=" << t_compute << " D2H=" << t_d2h
               << " Forward=" << t_fwd << " Encode=" << t_encode << "\n";
     }
+
+#ifdef ENABLE_ENERGY
+    if (energy_tracker) {
+        energy_tracker->stop();
+        energy_tracker->calculate_energy();
+        std::cout << "[energy] Compression energy:" << std::endl;
+        energy_tracker->print_energy();
+        std::string csv_path = output_path + ".compress_energy.csv";
+        energy_tracker->save_csv(csv_path);
+        std::cout << "[energy] Saved to " << csv_path << std::endl;
+        delete energy_tracker;
+    }
+#endif
     
     checkCudaErrors(cudaEventDestroy(ev_start));
     checkCudaErrors(cudaEventDestroy(ev_mid));
@@ -557,6 +583,15 @@ void compress_v2(const std::string& model_path, const std::string& input_path, c
 
 void decompress_v2(const std::string& model_path, const std::string& input_path, const std::string& output_path, MambaConfig config, int gpu_batch, size_t chunk_size) {
     int BATCH_SIZE = (gpu_batch > 0) ? gpu_batch : 64;
+
+#ifdef ENABLE_ENERGY
+    EnergyTracker* energy_tracker = nullptr;
+    if (g_measure_energy) {
+        energy_tracker = new EnergyTracker();
+        energy_tracker->start();
+        std::cout << "[energy] Started energy measurement for decompression" << std::endl;
+    }
+#endif
 
     gpu_init_exp_lut();
     
@@ -745,6 +780,19 @@ void decompress_v2(const std::string& model_path, const std::string& input_path,
     double mb_s = (double)total_size / (1024.0 * 1024.0) / duration;
     std::cout << "\nDone. Time: " << duration << "s, Avg Throughput: " << mb_s << " MB/s\n";
 
+#ifdef ENABLE_ENERGY
+    if (energy_tracker) {
+        energy_tracker->stop();
+        energy_tracker->calculate_energy();
+        std::cout << "[energy] Decompression energy:" << std::endl;
+        energy_tracker->print_energy();
+        std::string csv_path = output_path + ".decompress_energy.csv";
+        energy_tracker->save_csv(csv_path);
+        std::cout << "[energy] Saved to " << csv_path << std::endl;
+        delete energy_tracker;
+    }
+#endif
+
     // Write all outputs
     for(int i=0; i<num_chunks; ++i) {
         fout.write((char*)all_outputs[i].data(), all_outputs[i].size());
@@ -770,11 +818,18 @@ void decompress_v2(const std::string& model_path, const std::string& input_path,
 
 int main(int argc, char** argv) {
     if (argc < 5) {
-        std::cerr << "Usage: boa <mode> <model> <input> <output> [d_model] [n_layers] [--backbone TYPE] [--gpu-batch B] [--max-chunks C] [--chunk-size S] [--tile T] [--warm-start] [--temperature T]\n";
+        std::cerr << "Usage: boa <mode> <model> <input> <output> [d_model] [n_layers] [--backbone TYPE] [--gpu-batch B] [--max-chunks C] [--chunk-size S] [--tile T] [--warm-start] [--temperature T]"
+#ifdef ENABLE_ENERGY
+                  << " [--measure-energy]"
+#endif
+                  << "\n";
         std::cerr << "  Backbones: mamba (default), lstm, gru, mingru\n";
         std::cerr << "  --tile T: Sub-chunk forward pass into tiles of T tokens (reduces VRAM, allows larger batches)\n";
         std::cerr << "  --warm-start: Interleaved chunk order for model state carry-forward (compress only)\n";
         std::cerr << "  --temperature T: Scale logits by 1/T before softmax (default: 1.0, <1 = sharper, >1 = softer)\n";
+#ifdef ENABLE_ENERGY
+        std::cerr << "  --measure-energy: Measure CPU/GPU energy consumption using CPPJoules (RAPL + NVML)\n";
+#endif
         return 1;
     }
 
@@ -820,6 +875,14 @@ int main(int argc, char** argv) {
         }
         if (s == "--warm-start") {
             warm_start = true;
+            continue;
+        }
+        if (s == "--measure-energy") {
+#ifdef ENABLE_ENERGY
+            g_measure_energy = true;
+#else
+            std::cerr << "Warning: --measure-energy requires building with -DENABLE_ENERGY. Ignored.\n";
+#endif
             continue;
         }
         if (s == "--tile" && i + 1 < argc) {

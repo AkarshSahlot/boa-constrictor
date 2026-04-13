@@ -55,6 +55,9 @@ BOA-AD/data/
 BOA-AD/lhco/
 portability_solved_cpp/*.bin
 portability_solved_cpp/boa_constrictor
+portability_solved_cpp/boa_constrictor.exe
+portability_solved_cpp/*.boa.compress_energy.csv
+portability_solved_cpp/*.boa.decompress_energy.csv
 .vscode/settings.json
 experiments/cms_experiment_*
 wandb/
@@ -133,3 +136,62 @@ experiments/dtype_float32_10ep/dtype_float32_10ep_final_model_bf16.pt
 experiments/dtype_integer_10ep/dtype_integer_10ep_final_model_bf16.pt
 experiments/hepmc_128x2_10ep/hepmc_128x2_10ep_final_model_bf16.pt
 experiments/hepmc_128x2_20ep/hepmc_128x2_20ep_final_model_bf16.pt
+apr_*
+apr_paper_results/*
+portability_solved_cpp/*.boa
+experiments/sweep*
+padded_chunk_sweep_results/*
+BOA_Constrictor__A_Mamba_based_lossless_compressor_for_scientific_data (11).pdf
+calc_250k.py
+calculate_unpadded.py
+cfd_256x1_train.log
+coding_overhead_test.py
+datafromCMSBUNDLEDRUN.csv
+decompression.drawio (1).png
+decompression.drawio (2).png
+decompression.drawio (2).png:Zone.Identifier
+padded_chunk_1050k.log
+padded_chunk_sweep.log
+padded_chunk_sweep.py
+plot_ratio_scaling.py
+plot_throughput_scaling.py
+precision_ablation.log
+ratio_scaling.png
+rawbasket_crossdataset_console.txt
+rawbasket_crossdataset_full.log
+rawbasket_crossdataset_log.txt
+rawbasket_scaling_log copy.txt
+rawbasket_scaling_log.txt
+run_classical_benchmarks.py
+run_cms_rawbasket_scaling.sh
+run_context_diagnostics.py
+run_diagnostics_apr.py
+run_lzma_and_boa.sh
+run_precision_ablation.sh
+run_rawbasket_crossdataset.sh
+throughput_scaling.png
+portability_solved_cpp/boa_compress.log
+experiments/cfd_experiment_d256_L1/cfd_256x1.boa
+experiments/cfd_experiment_d256_L1/cfd_256x1_fp32.bin
+experiments/cfd_experiment_d256_L1/cfd_256x1_decompressed.bin
+experiments/cfd_experiment_d128_L2_f0.20/cfd_128x2.boa
+experiments/cfd_experiment_d128_L2_f0.20/cfd_128x2_fp32.bin
+experiments/cfd_experiment_d128_L2_f0.20/cfd_128x2_decompressed.bin
+experiments/camel_experiment_d256_L1/camel_256x1.boa
+experiments/camel_experiment_d256_L1/camel_256x1_fp32.bin
+experiments/camel_experiment_d256_L1/camel_256x1_decompressed.bin
+experiments/camel_experiment_d128_L2_f0.20/camel_128x2_fp32.bin
+experiments/camel_experiment_d128_L2_f0.20/camel_128x2.boa
+experiments/camel_experiment_d128_L2_f0.20/camel_128x2_decompressed.bin
+experiments/nanoaod_rawbasket_128x2_10ep/nanoaod_rawbasket_128x2_10ep_final_model_bf16.pt
+experiments/cfd_experiment_d256_L1/cfd_experiment_d256_L1_final_model_bf16.pt
+experiments/cfd_experiment_d128_L2_f0.20/cfd_experiment_d128_L2_f0.20_final_model_bf16.pt
+experiments/camel_experiment_d256_L1/camel_experiment_d256_L1_final_model_bf16.pt
+experiments/camel_experiment_d128_L2_f0.20/camel_experiment_d128_L2_f0.20_final_model_bf16.pt
+experiments/atlas_colmajor_100pct_128x2_10ep/atlas_colmajor_100pct_128x2_10ep.yaml
+experiments/atlas_colmajor_100pct_128x2_10ep/atlas_colmajor_100pct_128x2_10ep_final_model_bf16.pt
+
+portability_solved_cpp/windows_build/*
+hepmc_energy_decomp.bin.decompress_energy.csv
+hepmc_energy_test.boa.compress_energy.csv
+extract_and_compress_50k.py

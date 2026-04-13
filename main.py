@@ -78,6 +78,7 @@ def parse_args():
     p.add_argument('--data-frac', type=float, default=1.0, help='Fraction of training data to use (0.0-1.0, default: 1.0)')
     p.add_argument('--adapt', type=float, nargs=2, metavar=('LR', 'STEPS'),
                    help='Enable online head adaptation with given learning rate and number of steps (e.g. --adapt 1e-3 1)')
+    p.add_argument('--measure-energy', action='store_true', help='Measure energy consumption during compression/decompression using CPPJoules (RAPL + NVML)')
     p.add_argument('--epochs', type=int, default=None, help='Override number of training epochs')
     p.add_argument('--lr', type=float, default=None, help='Override learning rate')
     p.add_argument('--patience', type=int, default=None, help='Override early stopping patience (0=disabled)')
@@ -824,7 +825,8 @@ def main():
     if args.adapt is not None:
         adapt_config = (args.adapt[0], int(args.adapt[1]))
 
-    boa = BOA(device, str(exp_dir / f"{name}.boa"), model, adapt_config=adapt_config)
+    boa = BOA(device, str(exp_dir / f"{name}.boa"), model, adapt_config=adapt_config,
+             measure_energy=getattr(args, 'measure_energy', False))
     file_format = compress_file_path.suffix.lstrip('.') or 'bin'
     # Compression
     if not args.train_only and not args.decompress_only and not args.evaluate_only:

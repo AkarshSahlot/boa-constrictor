@@ -12,7 +12,7 @@ except ImportError:
     _HAS_ADAPT = False
 
 
-def BOA(device, filepath: str, model, adapt_config=None):
+def BOA(device, filepath: str, model, adapt_config=None, measure_energy=False):
     IS_CUDA = device == "cuda" and torch.cuda.is_available()
 
     if IS_CUDA:
@@ -21,6 +21,17 @@ def BOA(device, filepath: str, model, adapt_config=None):
     else:
         from codec import compress_CPU as compress, decompress_CPU as decompress
         device = "cpu"
+
+    # Energy measurement setup
+    _energy_tracker = None
+    if measure_energy:
+        try:
+            from energy_tracker import EnergyTracker as _ET
+            _energy_tracker = _ET
+        except Exception as e:
+            print(f"[WARN] --measure-energy requested but energy_tracker unavailable: {e}")
+            print("       Build CPPJoules first (see portability_solved_cpp/CPPJoules/)")
+            _energy_tracker = None
 
     def _uvarint_encode(x: int) -> bytes:
         out = bytearray()
@@ -178,6 +189,14 @@ def BOA(device, filepath: str, model, adapt_config=None):
             }
 
         def compress(self, data_path: str, seq_size: int = 0, chunks_count: int = 0, progress: bool = True):
+            # Energy tracking
+            _tracker = None
+            if _energy_tracker is not None:
+                _tracker = _energy_tracker()
+                _tracker.start()
+                if progress:
+                    print("[energy] Started energy measurement for compression")
+
             # Determine chunking from file size without loading entire file into RAM
             p = Path(data_path)
             total_size = p.stat().st_size
@@ -301,6 +320,14 @@ def BOA(device, filepath: str, model, adapt_config=None):
             self.lengths = [chunk_len] * (n_chunks - 1) + [last_chunk_len]
             print(f"Compression complete: {n_chunks} chunks, chunk_len={chunk_len}, last={last_chunk_len}")
 
+            # Energy tracking: stop and report
+            if _tracker is not None:
+                _tracker.stop()
+                print(f"[energy] Compression energy: {_tracker.summary_str()}")
+                csv_path = str(self.filepath) + ".compress_energy.csv"
+                _tracker.save_csv(csv_path)
+                print(f"[energy] Saved to {csv_path}")
+
         def read_from_disk(self):
             self._read_file()
             print("File loaded successfully")
@@ -308,6 +335,14 @@ def BOA(device, filepath: str, model, adapt_config=None):
         def decompress(self, progress: bool = True) -> bytes:
             self._read_file()
             print(f"Total compressed size from disk: {sum(len(c) for c in self.compressed_data)} bytes")
+
+            # Energy tracking
+            _tracker = None
+            if _energy_tracker is not None:
+                _tracker = _energy_tracker()
+                _tracker.start()
+                if progress:
+                    print("[energy] Started energy measurement for decompression")
 
             # Decompress in batches to limit GPU memory and align with encoder batch semantics
             try:
@@ -355,6 +390,14 @@ def BOA(device, filepath: str, model, adapt_config=None):
             # Restore head to original state (clean up after decompression)
             if adapter is not None:
                 adapter.restore_head()
+
+            # Energy tracking: stop and report
+            if _tracker is not None:
+                _tracker.stop()
+                print(f"[energy] Decompression energy: {_tracker.summary_str()}")
+                csv_path = str(self.filepath) + ".decompress_energy.csv"
+                _tracker.save_csv(csv_path)
+                print(f"[energy] Saved to {csv_path}")
 
             return b"".join(out_parts)
 
